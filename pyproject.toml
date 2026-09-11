@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runpod-test-flash-app"
+version = "0.1.0"
+description = "Runpod Flash Serverless Application"
+readme = "README.md"
+requires-python = ">=3.12,<3.13" 
+dependencies = ["runpod-flash"]
+
+[tool.uv]
+package = false
