@@ -3,8 +3,6 @@
 # test directly: python segment_worker.py
 from runpod_flash import Endpoint, GpuGroup
 
-MODEL_ID = "facebook/sam-vit-base"
-
 
 @Endpoint(
     name="segment_worker",
@@ -18,10 +16,11 @@ class SamSegmenter:
         import torch
         from transformers import SamModel, SamProcessor
 
+        model_id = "facebook/sam-vit-base"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SamModel.from_pretrained(MODEL_ID).to(self.device)
+        self.model = SamModel.from_pretrained(model_id).to(self.device)
         self.model.eval()
-        self.processor = SamProcessor.from_pretrained(MODEL_ID)
+        self.processor = SamProcessor.from_pretrained(model_id)
 
     async def segment(self, input_data: dict) -> dict:
         """

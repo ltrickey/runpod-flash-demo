@@ -4,8 +4,6 @@
 # test directly: python classify_worker.py
 from runpod_flash import Endpoint, GpuGroup
 
-MODEL_ID = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
-
 
 @Endpoint(
     name="classify_worker",
@@ -19,12 +17,13 @@ class BeitClassifier:
         import torch
         from transformers import AutoImageProcessor, AutoModelForImageClassification
 
+        model_id = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModelForImageClassification.from_pretrained(MODEL_ID).to(
+        self.model = AutoModelForImageClassification.from_pretrained(model_id).to(
             self.device
         )
         self.model.eval()
-        self.processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+        self.processor = AutoImageProcessor.from_pretrained(model_id)
 
     async def classify(self, input_data: dict) -> dict:
         """
