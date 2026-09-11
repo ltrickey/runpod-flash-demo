@@ -33,11 +33,24 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 
 | File | Type | Role |
 |------|------|------|
-| `segment_worker.py` | GPU, queue-based (class) | SAM segmentation |
-| `classify_worker.py` | GPU, queue-based (class) | BEiT classification |
+| `segment_worker.py` | GPU, queue-based (function) | SAM segmentation |
+| `classify_worker.py` | GPU, queue-based (function) | BEiT classification |
 | `pipeline.py` | CPU, load-balanced | Orchestrates segment → classify |
 | `demo_client.py` | local script | Reads an image file, calls `/pipeline/analyze` |
 | `sample_images/` | test fixtures | One real HAM10000 photo per diagnostic class |
+
+`segment_worker.py` and `classify_worker.py` are plain function endpoints
+(not class-based): `pipeline.py` chains them by directly importing and
+`await`-ing them, following the pattern in
+`flash-examples/01_getting_started/03_mixed_workers`. A class-based
+`@Endpoint` (model loaded once in `__init__`) can't be called this way —
+Flash's cross-worker chaining only supports functions — nor can it be called
+from `Endpoint(id=...)` client mode, since that requires speaking an
+undocumented internal wire protocol. Each call currently reloads the model
+from Hugging Face; a documented module-level caching pattern exists
+(`flash-examples/docs/cli/workflows.md`, "Reduce cold starts") but only
+applies to `flash deploy`'s real container image, not `flash dev`'s
+live/on-demand testing mode — worth re-testing once deployed.
 
 ### Demo
 
@@ -74,7 +87,73 @@ gpu=[GpuGroup.ADA_24, GpuGroup.AMPERE_24, GpuGroup.AMPERE_16]
 
 ---
 
-## Quick Start
+## Testing Locally with `flash dev`
+
+`flash dev` runs a local dev server that auto-discovers every `@Endpoint` in
+the project and exposes it over HTTP on your machine — but for GPU/CPU
+queue-based workers (`segment_worker`, `classify_worker`) it **provisions
+real, billable Runpod serverless workers**, not free local compute. "Dev"
+here means "a local server you can iterate against," not "runs on your own
+hardware." Each worker scales to 0 (`workers=(0, 3)`) when idle, so you're
+only charged for actual GPU time during a call, but every test invocation
+does cost a small amount.
+
+### Steps
+
+```bash
+cd runpod_trial
+uv venv && source .venv/bin/activate   # or: python -m venv .venv && source .venv/bin/activate
+uv sync                                 # or: pip install -r requirements.txt
+flash login                             # authenticate once, or set RUNPOD_API_KEY in .env
+flash dev
+```
+
+This prints the routes it discovered:
+
+```
+POST  /classify_worker/runsync  classify  QB
+POST  /pipeline/analyze         analyze   LB
+GET   /pipeline/health          health    LB
+POST  /segment_worker/runsync   segment   QB
+```
+
+Visit **http://localhost:8888/docs** for interactive Swagger UI, or drive it
+from the terminal:
+
+```bash
+# Easiest: run the full pipeline against a real sample image
+python demo_client.py sample_images/mel_ISIC_0024351.jpg
+
+# Or call the full pipeline directly with curl
+curl -X POST http://localhost:8888/pipeline/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"input_data": {"image_base64": "'"$(base64 -i sample_images/bcc_ISIC_0024431.jpg)"'"}}'
+
+# Or test one stage in isolation
+curl -X POST http://localhost:8888/segment_worker/runsync \
+  -H "Content-Type: application/json" \
+  -d '{"input": {"input_data": {"image_base64": "'"$(base64 -i sample_images/bcc_ISIC_0024431.jpg)"'"}}}'
+```
+
+The first call to a given worker takes longer (a real GPU is being spun up
+and SAM/BEiT are downloaded from Hugging Face); subsequent calls to a warm
+worker are faster, though each call currently still reloads the model
+in-process (see the caching note above).
+
+Press **Ctrl+C** to stop the server — this cleans up the Runpod endpoints
+that `flash dev` provisioned during the session, so nothing keeps running
+(and billing) after you stop.
+
+### Checking on things independently
+
+The Runpod console (Serverless tab) shows dev-provisioned endpoints prefixed
+with `live-` (e.g. `live-segment_worker`) — useful for confirming a worker
+actually spun up, checking logs, or seeing GPU/worker status if a request
+seems stuck.
+
+---
+
+## Prerequisites
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended Python package manager):
 
@@ -82,29 +161,13 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommend
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Set up the project:
+See "Testing Locally with `flash dev`" above for setup and run steps.
 
-```bash
-uv venv && source .venv/bin/activate
-uv sync
-flash login              # Authenticate with Runpod
-flash dev
-```
-
-Or with pip:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-flash login              # Authenticate with Runpod
-flash dev
-```
-
-Server starts at **http://localhost:8888**. Visit **http://localhost:8888/docs** for interactive Swagger UI.
-
-Use `flash dev --auto-provision` to pre-deploy all endpoints on startup, eliminating cold-start delays on first request. Provisioned endpoints are cached and reused across restarts.
-
-When you stop the server with Ctrl+C, all endpoints provisioned during the session are automatically cleaned up.
+Tip: `flash dev --auto-provision` pre-deploys all endpoints on startup instead
+of lazily on first request, eliminating cold-start delay on your *first*
+test call (provisioned endpoints are cached and reused across restarts) —
+but note this also means the GPU workers spin up immediately, not just when
+you actually call them.
 
 ## Project Structure
 
@@ -126,8 +189,8 @@ runpod_trial/
 
 QB workers process jobs from a queue. Each call to `/runsync` sends a job and waits
 for the result. Use QB for compute-heavy tasks that may take seconds to minutes.
-`segment_worker.py` and `classify_worker.py` are both class-based QB workers: the
-model loads once in `__init__` and is reused across requests on a warm worker.
+`segment_worker.py` and `classify_worker.py` are both function-based QB workers
+(see the caching note above for why, and the current tradeoff on model reloads).
 
 ### Load-Balanced (LB) Workers
 

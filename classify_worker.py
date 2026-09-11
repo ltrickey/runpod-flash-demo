@@ -2,74 +2,74 @@
 # fine-tuned on HAM10000 (7-class: akiec, bcc, bkl, df, mel, nv, vasc).
 # run with: flash dev
 # test directly: python classify_worker.py
+#
+# NOTE: flash-examples/docs/cli/workflows.md documents a module-level global
+# cache (`global _MODEL`) to avoid reloading the model on every call. That
+# does NOT work under `flash dev` (confirmed by testing: NameError, since
+# live/on-demand provisioning ships only the decorated function's isolated
+# source, not surrounding module state) -- it may work after `flash deploy`
+# bakes the whole file into a real container image with normal Python import
+# semantics. Reloading every call for now; re-test caching after deploying.
 from runpod_flash import Endpoint, GpuGroup
 
 
 @Endpoint(
     name="classify_worker",
     gpu=[GpuGroup.ADA_24, GpuGroup.AMPERE_24, GpuGroup.AMPERE_16],
-    workers=(0, 3),
+    workers=(0, 3),  # scales to 0 when idle (no charges); use (1, 3) to keep
+    # one worker always warm and skip the first-request cold start/model load
+    # at the cost of continuous GPU billing.
     idle_timeout=300,
     dependencies=["transformers", "pillow"],
 )
-class BeitClassifier:
-    def __init__(self):
-        import torch
-        from transformers import AutoImageProcessor, AutoModelForImageClassification
+async def classify(input_data: dict) -> dict:
+    """
+    Classify a segmented lesion image with the HAM10000-finetuned BEiT model.
 
+    Input:
+        image_base64: str - base64-encoded segmented lesion image (e.g. the
+            output of segment_worker.segment)
+
+    Returns:
+        label: str - predicted HAM10000 diagnostic class
+        confidence: float - softmax probability of the predicted class
+        all_scores: dict[str, float] - probability for every class
+    """
+    import base64
+    import io
+
+    import torch
+    from PIL import Image
+    from transformers import AutoImageProcessor, AutoModelForImageClassification
+
+    try:
         model_id = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModelForImageClassification.from_pretrained(model_id).to(
-            self.device
-        )
-        self.model.eval()
-        self.processor = AutoImageProcessor.from_pretrained(model_id)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = AutoModelForImageClassification.from_pretrained(model_id).to(device)
+        model.eval()
+        processor = AutoImageProcessor.from_pretrained(model_id)
 
-    async def classify(self, input_data: dict) -> dict:
-        """
-        Classify a segmented lesion image with the HAM10000-finetuned BEiT model.
+        image_bytes = base64.b64decode(input_data["image_base64"])
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        Input:
-            image_base64: str - base64-encoded segmented lesion image (e.g. the
-                output of segment_worker.SamSegmenter.segment)
+        inputs = processor(images=image, return_tensors="pt").to(device)
 
-        Returns:
-            label: str - predicted HAM10000 diagnostic class
-            confidence: float - softmax probability of the predicted class
-            all_scores: dict[str, float] - probability for every class
-        """
-        import base64
-        import io
+        with torch.no_grad():
+            outputs = model(**inputs)
 
-        import torch
-        from PIL import Image
+        probs = torch.softmax(outputs.logits, dim=-1)[0].cpu()
+        top_idx = int(probs.argmax())
+        id2label = model.config.id2label
 
-        try:
-            image_bytes = base64.b64decode(input_data["image_base64"])
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return {
+            "status": "success",
+            "label": id2label[top_idx],
+            "confidence": float(probs[top_idx]),
+            "all_scores": {id2label[i]: float(probs[i]) for i in range(len(probs))},
+        }
 
-            inputs = self.processor(images=image, return_tensors="pt").to(
-                self.device
-            )
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-
-            probs = torch.softmax(outputs.logits, dim=-1)[0].cpu()
-            top_idx = int(probs.argmax())
-            id2label = self.model.config.id2label
-
-            return {
-                "status": "success",
-                "label": id2label[top_idx],
-                "confidence": float(probs[top_idx]),
-                "all_scores": {
-                    id2label[i]: float(probs[i]) for i in range(len(probs))
-                },
-            }
-
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 if __name__ == "__main__":
@@ -89,8 +89,7 @@ if __name__ == "__main__":
 
     test_payload = {"image_base64": make_test_image()}
     print("Testing BEiT classify worker with a synthetic lesion image")
-    classifier = BeitClassifier()
-    result = asyncio.run(classifier.classify(test_payload))
+    result = asyncio.run(classify(test_payload))
     if result["status"] == "success":
         print(f"Success! label={result['label']} confidence={result['confidence']:.4f}")
     else:
