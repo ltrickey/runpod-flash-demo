@@ -2,7 +2,7 @@
 # thin load-balanced client that chains segment_worker and classify_worker,
 # following the CPU->GPU->CPU pipeline pattern from
 # flash-examples/01_getting_started/03_mixed_workers/pipeline.py.
-# run with: flash dev
+
 from runpod_flash import Endpoint
 
 pipeline = Endpoint(name="lesion_pipeline", cpu="cpu3c-1-2", workers=(1, 3))
@@ -20,7 +20,9 @@ async def analyze(input_data: dict) -> dict:
         label: str - predicted HAM10000 diagnostic class
         confidence: float - softmax probability of the predicted class
         all_scores: dict[str, float] - probability for every class
-        segmentation: dict - bbox and score from the segmentation stage
+        segmentation: dict - bbox, score, and the cropped/masked lesion image
+            (base64 PNG) from the segmentation stage, so the response shows
+            what each step actually produced
     """
     from classify_worker import classify
     from segment_worker import segment
@@ -43,6 +45,7 @@ async def analyze(input_data: dict) -> dict:
         "segmentation": {
             "bbox": segment_result["bbox"],
             "score": segment_result["score"],
+            "segmented_image_base64": segment_result["segmented_image_base64"],
         },
     }
 
