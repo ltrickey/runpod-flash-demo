@@ -15,19 +15,29 @@ async def analyze(input_data: dict) -> dict:
 
     Input:
         image_base64: str - base64-encoded source image
+        apply_mask: bool - black out non-lesion pixels before classifying
+            (default True). Set False to crop to the lesion without masking;
+            see segment_worker for why this materially changes accuracy.
 
     Returns:
         label: str - predicted HAM10000 diagnostic class
         confidence: float - softmax probability of the predicted class
         all_scores: dict[str, float] - probability for every class
-        segmentation: dict - bbox, score, and the cropped/masked lesion image
-            (base64 PNG) from the segmentation stage, so the response shows
-            what each step actually produced
+        segmentation: dict - what the SAM stage produced: the lesion image
+            (base64 PNG), its bbox, SAM's IoU score, the coverage/solidity
+            selection metrics, `applied` (False when no coherent mask was
+            found and the original image was passed through unchanged), and
+            `mask_applied` (whether pixels were actually blacked out)
     """
     from classify_worker import classify
     from segment_worker import segment
 
-    segment_result = await segment({"image_base64": input_data["image_base64"]})
+    segment_result = await segment(
+        {
+            "image_base64": input_data["image_base64"],
+            "apply_mask": input_data.get("apply_mask", True),
+        }
+    )
     if segment_result.get("status") != "success":
         return {"status": "error", "stage": "segment", "error": segment_result.get("error")}
 
@@ -43,8 +53,12 @@ async def analyze(input_data: dict) -> dict:
         "confidence": classify_result["confidence"],
         "all_scores": classify_result["all_scores"],
         "segmentation": {
+            "applied": segment_result["segmentation_applied"],
+            "mask_applied": segment_result["mask_applied"],
             "bbox": segment_result["bbox"],
             "score": segment_result["score"],
+            "coverage": segment_result["coverage"],
+            "solidity": segment_result["solidity"],
             "segmented_image_base64": segment_result["segmented_image_base64"],
         },
     }

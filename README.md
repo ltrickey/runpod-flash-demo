@@ -17,14 +17,46 @@ image_base64
     |
 segment_worker.py (GPU, SAM)
     - decode image, prompt SAM at the image center
-    - crop to the highest-confidence mask's bounding box
+    - pick a coherent lesion mask (coverage + solidity filtered)
+    - black out non-lesion pixels, crop to the mask's bounding box
     |
 classify_worker.py (GPU, BEiT)
-    - classify the cropped lesion
+    - classify the masked lesion
     - softmax over 7 HAM10000 classes
     |
-{"label": ..., "confidence": ..., "all_scores": {...}}
+{"label": ..., "confidence": ..., "all_scores": {...},
+ "segmentation": {"applied": ..., "segmented_image_base64": ..., ...}}
 ```
+
+### How the SAM mask is chosen
+
+SAM returns three candidate masks at different granularities. Taking the
+highest IoU naively selects the **whole-frame** mask on most dermoscopy
+images, which silently makes segmentation a no-op (the classifier just sees
+the original image). Candidates are therefore filtered on two metrics before
+preferring highest IoU:
+
+| Metric | Meaning | Accept |
+|--------|---------|--------|
+| coverage | fraction of the frame the mask occupies | 3%–90% |
+| solidity | fraction of its own bbox the mask fills | ≥ 0.40 |
+
+Solidity is what rejects **fragmented** masks: scattered hairs/streaks can
+pass the coverage check while being useless to classify. Measured on the
+sample images, real lesions score 0.42–0.78 solidity; streak masks score
+0.07–0.21.
+
+If no candidate is coherent, the original image is passed through unmasked
+and `segmentation.applied` is `false` — better than handing the classifier
+garbage. On the seven sample images, 5 segment cleanly and 2 (`bcc`, `nv`)
+fall back.
+
+A caveat worth knowing: HAM10000 images are already cropped and centered on
+the lesion, so segmentation legitimately won't shrink them dramatically —
+SAM's contribution here is masking out surrounding skin and vignetting. On
+diffuse lesions with no crisp boundary, SAM's mask is weak regardless of
+prompt (a box prompt was tested and largely returns whatever box you give
+it, so the canonical point prompt is used instead).
 
 `pipeline.py` is a thin load-balanced orchestrator that calls both endpoints in
 sequence and exposes the whole thing as a single `POST /analyze` call.
@@ -46,17 +78,61 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 `@Endpoint` (model loaded once in `__init__`) can't be called this way —
 Flash's cross-worker chaining only supports functions — nor can it be called
 from `Endpoint(id=...)` client mode, since that requires speaking an
-undocumented internal wire protocol. Each call currently reloads the model
-from Hugging Face; a documented module-level caching pattern exists
-(`flash-examples/docs/cli/workflows.md`, "Reduce cold starts") but only
-applies to `flash deploy`'s real container image, not `flash dev`'s
-live/on-demand testing mode — worth re-testing once deployed.
+undocumented internal wire protocol.
+
+### Model caching: dev vs. deployed
+
+Both workers cache their model in a module-level global and load it only on
+first use. **This behaves differently in `flash dev` vs. `flash deploy`:**
+
+| | Module-level globals | Why |
+|---|---|---|
+| `flash dev` | ✗ `NameError` | Live/on-demand provisioning ships only the decorated function's *isolated source*, without surrounding module state (see `runpod_flash.endpoint._is_live_provisioning`) |
+| `flash deploy` | ✓ works | The whole file is baked into the container image and imported normally, so module state persists across requests on a warm worker |
+
+Confirmed in the deployed worker logs: the first request logs
+`Loading weights: 100%|██████████| 314/314` and takes ~12s; the next request
+logs no weight loading at all and takes ~1.4s — roughly a 9x speedup.
+
+The practical consequence is that the caching pattern documented in
+`flash-examples/docs/cli/workflows.md` ("Reduce cold starts") **cannot be
+validated under `flash dev`** — it only works once deployed.
 
 ### Demo
 
 ```bash
+# against a local flash dev server
 python demo_client.py sample_images/mel_ISIC_0024351.jpg
+
+# against the deployed pipeline (needs RUNPOD_API_KEY in env or .env)
+python demo_client.py sample_images/mel_ISIC_0024351.jpg \
+  --url https://uvu4lc1mmlihc0.api.runpod.ai --out-dir results
 ```
+
+`demo_client.py` prints the JSON result and writes the masked lesion crop to
+`<image>_segmented.png`, so you can show the original and what SAM actually
+produced side by side.
+
+### Deployed endpoints
+
+| Endpoint | URL |
+|----------|-----|
+| `lesion_pipeline` (LB) | `https://uvu4lc1mmlihc0.api.runpod.ai` — `POST /analyze`, `GET /health` |
+| `segment_worker` (QB) | `https://api.runpod.ai/v2/4h6wodvsn0zap7/runsync` |
+| `classify_worker` (QB) | `https://api.runpod.ai/v2/8064syplx1zsn0/runsync` |
+
+Two differences from local `flash dev` to watch for:
+
+- **Auth**: deployed endpoints require `Authorization: Bearer $RUNPOD_API_KEY`;
+  local `flash dev` does not.
+- **Routes**: a deployed load-balanced endpoint serves its routes at the root
+  (`/analyze`), while `flash dev` namespaces them under the endpoint name
+  (`/pipeline/analyze`). `demo_client.py` handles both automatically.
+
+**Cold-start caveat for live demos:** the LB gateway times out around ~40s, but
+a fully cold `/analyze` (both GPU workers provisioning, plus downloading SAM
+and BEiT) takes longer and returns a 502. Warm calls complete in ~5s. Send one
+throwaway request to warm the workers before presenting.
 
 ### Test the Pipeline
 
@@ -73,8 +149,12 @@ curl -X POST http://localhost:8888/segment_worker/runsync \
 
 curl -X POST http://localhost:8888/classify_worker/runsync \
   -H "Content-Type: application/json" \
-  -d '{"input": {"input_data": {"image_base64": "<base64-encoded-crop>"}}}'
+  -d '{"input": {"input_data": {"image_base64": "<base64-encoded-masked-lesion>"}}}'
 ```
+
+`segment_worker` returns `segmented_image_base64` (the masked lesion) plus
+`segmentation_applied`, `bbox`, `score`, `coverage` and `solidity` — feed that
+image straight into `classify_worker`.
 
 ### GPU Configuration
 
@@ -215,6 +295,12 @@ print(job.output)
 ep = Endpoint(name="vllm", image="runpod/worker-vllm:stable-cuda12.1.0")
 result = await ep.post("/v1/completions", {"prompt": "hello"})
 ```
+
+This project doesn't use client mode — `pipeline.py` chains `segment_worker`/
+`classify_worker` via direct import instead (see the caching note above).
+Confirmed client mode can't invoke a **class-based** `@Endpoint` (undocumented
+internal protocol); untested against our current **function-based** workers.
+Worth trying once deployed, alongside the caching re-test.
 
 ## Adding New Workers
 
