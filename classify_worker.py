@@ -3,22 +3,15 @@
 # run with: flash dev
 # test directly: python classify_worker.py
 #
-# NOTE on caching: flash-examples/docs/cli/workflows.md documents this exact
-# module-level global pattern to avoid reloading the model on every call.
-# Confirmed it does NOT work under `flash dev` (NameError -- live/on-demand
-# provisioning ships only the decorated function's isolated source, not
-# surrounding module state; see runpod_flash.endpoint._is_live_provisioning,
-# which is True for flash dev and False only for flash build/deploy). It's
-# re-enabled here to test after `flash deploy`, where the whole file is
-# baked into a real container image and imported normally, so module-level
-# state should persist across requests on the same warm worker. If it still
-# doesn't work post-deploy, revert to loading fresh inside the function body
-# (see git history) and reload every call.
+# The model is loaded inside the function on every call. Caching it in a
+# module-level global does speed this up (measured ~12s -> ~1.4s once warm),
+# but only when deployed -- under `flash dev` it raises NameError, because
+# live provisioning ships the decorated function's source in isolation
+# without the surrounding module. That split is written up in the README;
+# it's left out of the code here to keep both paths working and the worker
+# simple. The same constraint is why this function body is self-contained
+# rather than calling module-level helpers.
 from runpod_flash import Endpoint, GpuGroup
-
-_MODEL = None
-_PROCESSOR = None
-_DEVICE = None
 
 
 @Endpoint(
@@ -50,29 +43,24 @@ async def classify(input_data: dict) -> dict:
     from PIL import Image
     from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-    global _MODEL, _PROCESSOR, _DEVICE
-
     try:
-        if _MODEL is None:
-            model_id = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
-            _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            _MODEL = AutoModelForImageClassification.from_pretrained(model_id).to(
-                _DEVICE
-            )
-            _MODEL.eval()
-            _PROCESSOR = AutoImageProcessor.from_pretrained(model_id)
+        model_id = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = AutoModelForImageClassification.from_pretrained(model_id).to(device)
+        model.eval()
+        processor = AutoImageProcessor.from_pretrained(model_id)
 
         image_bytes = base64.b64decode(input_data["image_base64"])
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-        inputs = _PROCESSOR(images=image, return_tensors="pt").to(_DEVICE)
+        inputs = processor(images=image, return_tensors="pt").to(device)
 
         with torch.no_grad():
-            outputs = _MODEL(**inputs)
+            outputs = model(**inputs)
 
         probs = torch.softmax(outputs.logits, dim=-1)[0].cpu()
         top_idx = int(probs.argmax())
-        id2label = _MODEL.config.id2label
+        id2label = model.config.id2label
 
         return {
             "status": "success",

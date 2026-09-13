@@ -1,21 +1,16 @@
 # gpu serverless worker -- segments a skin lesion from an image using SAM.
+# run with: flash dev
+# test directly: python segment_worker.py
 #
-# NOTE on caching: flash-examples/docs/cli/workflows.md documents this exact
-# module-level global pattern to avoid reloading the model on every call.
-# Confirmed it does NOT work under `flash dev` (NameError -- live/on-demand
-# provisioning ships only the decorated function's isolated source, not
-# surrounding module state; see runpod_flash.endpoint._is_live_provisioning,
-# which is True for flash dev and False only for flash build/deploy). It's
-# re-enabled here to test after `flash deploy`, where the whole file is
-# baked into a real container image and imported normally, so module-level
-# state should persist across requests on the same warm worker. If it still
-# doesn't work post-deploy, revert to loading fresh inside the function body
-# (see git history) and reload every call.
+# The model is loaded inside the function on every call. Caching it in a
+# module-level global does speed this up (measured ~12s -> ~1.4s once warm),
+# but only when deployed -- under `flash dev` it raises NameError, because
+# live provisioning ships the decorated function's source in isolation
+# without the surrounding module. That split is written up in the README;
+# it's left out of the code here to keep both paths working and the worker
+# simple. The same constraint is why this function body is self-contained
+# rather than calling module-level helpers.
 from runpod_flash import Endpoint, GpuGroup
-
-_MODEL = None
-_PROCESSOR = None
-_DEVICE = None
 
 
 @Endpoint(
@@ -79,18 +74,15 @@ async def segment(input_data: dict) -> dict:
     from PIL import Image
     from transformers import SamModel, SamProcessor
 
-    global _MODEL, _PROCESSOR, _DEVICE
-
     min_coverage, max_coverage, min_solidity = 0.03, 0.90, 0.40
     apply_mask = input_data.get("apply_mask", True)
 
     try:
-        if _MODEL is None:
-            model_id = "facebook/sam-vit-base"
-            _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            _MODEL = SamModel.from_pretrained(model_id).to(_DEVICE)
-            _MODEL.eval()
-            _PROCESSOR = SamProcessor.from_pretrained(model_id)
+        model_id = "facebook/sam-vit-base"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SamModel.from_pretrained(model_id).to(device)
+        model.eval()
+        processor = SamProcessor.from_pretrained(model_id)
 
         image_bytes = base64.b64decode(input_data["image_base64"])
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -99,14 +91,14 @@ async def segment(input_data: dict) -> dict:
         total_px = width * height
         center_point = [[[width // 2, height // 2]]]
 
-        inputs = _PROCESSOR(
+        inputs = processor(
             image, input_points=center_point, return_tensors="pt"
-        ).to(_DEVICE)
+        ).to(device)
 
         with torch.no_grad():
-            outputs = _MODEL(**inputs)
+            outputs = model(**inputs)
 
-        masks = _PROCESSOR.image_processor.post_process_masks(
+        masks = processor.image_processor.post_process_masks(
             outputs.pred_masks.cpu(),
             inputs["original_sizes"].cpu(),
             inputs["reshaped_input_sizes"].cpu(),

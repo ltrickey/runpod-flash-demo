@@ -1,7 +1,13 @@
 # Sample Images
 
-Seven real HAM10000 lesion photos, one per diagnostic class, for demoing and
-testing the pipeline (`segment_worker.py` -> `classify_worker.py` -> `pipeline.py`).
+Seven real HAM10000 lesion photos, one per diagnostic class, used as demo
+fixtures for the pipeline.
+
+These are for *showing* the pipeline on a single image. For measuring
+accuracy, use `../eval_images/` instead — 35 held-out images (5 per class,
+no overlap with these seven) scored by `eval_sweep.py`. Seven images is far
+too small a sample to draw conclusions from; an early 7-image run suggested
+near-perfect accuracy that the larger set did not bear out.
 
 | File | Class | Meaning |
 |------|-------|---------|

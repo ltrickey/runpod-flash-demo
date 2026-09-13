@@ -13,37 +13,75 @@ async def analyze(input_data: dict) -> dict:
     """
     Full pipeline: segment a lesion with SAM, then classify it with BEiT.
 
+    Three levels of preprocessing are selectable, so the pipeline can be
+    measured against itself:
+
+        segment=True,  apply_mask=True   -> lesion cropped, background blacked out
+        segment=True,  apply_mask=False  -> lesion cropped, real pixels kept
+        segment=False                    -> SAM skipped entirely, raw image classified
+
+    The third is the baseline that answers whether segmentation earns its
+    place at all: it bypasses segment_worker rather than merely softening
+    what it does.
+
     Input:
         image_base64: str - base64-encoded source image
-        apply_mask: bool - black out non-lesion pixels before classifying
-            (default True). Set False to crop to the lesion without masking;
-            see segment_worker for why this materially changes accuracy.
+        segment: bool - run the SAM stage (default True). False sends the
+            original image straight to the classifier.
+        apply_mask: bool - black out non-lesion pixels (default True).
+            Ignored when segment is False.
 
     Returns:
         label: str - predicted HAM10000 diagnostic class
         confidence: float - softmax probability of the predicted class
         all_scores: dict[str, float] - probability for every class
-        segmentation: dict - what the SAM stage produced: the lesion image
-            (base64 PNG), its bbox, SAM's IoU score, the coverage/solidity
-            selection metrics, `applied` (False when no coherent mask was
-            found and the original image was passed through unchanged), and
-            `mask_applied` (whether pixels were actually blacked out)
+        segmentation: dict - what the SAM stage did. `requested` is False when
+            bypassed; `applied` is False when bypassed or when no coherent
+            mask was found; `mask_applied` says whether pixels were blacked
+            out. `segmented_image_base64` is always the image that was
+            actually classified, so callers can render it uniformly.
     """
     from classify_worker import classify
     from segment_worker import segment
 
-    segment_result = await segment(
-        {
-            "image_base64": input_data["image_base64"],
-            "apply_mask": input_data.get("apply_mask", True),
-        }
-    )
-    if segment_result.get("status") != "success":
-        return {"status": "error", "stage": "segment", "error": segment_result.get("error")}
+    image_base64 = input_data["image_base64"]
+    segment_requested = input_data.get("segment", True)
 
-    classify_result = await classify(
-        {"image_base64": segment_result["segmented_image_base64"]}
-    )
+    if segment_requested:
+        segment_result = await segment(
+            {
+                "image_base64": image_base64,
+                "apply_mask": input_data.get("apply_mask", True),
+            }
+        )
+        if segment_result.get("status") != "success":
+            return {"status": "error", "stage": "segment", "error": segment_result.get("error")}
+
+        classified_image = segment_result["segmented_image_base64"]
+        segmentation = {
+            "requested": True,
+            "applied": segment_result["segmentation_applied"],
+            "mask_applied": segment_result["mask_applied"],
+            "bbox": segment_result["bbox"],
+            "score": segment_result["score"],
+            "coverage": segment_result["coverage"],
+            "solidity": segment_result["solidity"],
+            "segmented_image_base64": classified_image,
+        }
+    else:
+        classified_image = image_base64
+        segmentation = {
+            "requested": False,
+            "applied": False,
+            "mask_applied": False,
+            "bbox": None,
+            "score": None,
+            "coverage": None,
+            "solidity": None,
+            "segmented_image_base64": classified_image,
+        }
+
+    classify_result = await classify({"image_base64": classified_image})
     if classify_result.get("status") != "success":
         return {"status": "error", "stage": "classify", "error": classify_result.get("error")}
 
@@ -52,15 +90,7 @@ async def analyze(input_data: dict) -> dict:
         "label": classify_result["label"],
         "confidence": classify_result["confidence"],
         "all_scores": classify_result["all_scores"],
-        "segmentation": {
-            "applied": segment_result["segmentation_applied"],
-            "mask_applied": segment_result["mask_applied"],
-            "bbox": segment_result["bbox"],
-            "score": segment_result["score"],
-            "coverage": segment_result["coverage"],
-            "solidity": segment_result["solidity"],
-            "segmented_image_base64": segment_result["segmented_image_base64"],
-        },
+        "segmentation": segmentation,
     }
 
 

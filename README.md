@@ -58,6 +58,75 @@ diffuse lesions with no crisp boundary, SAM's mask is weak regardless of
 prompt (a box prompt was tested and largely returns whatever box you give
 it, so the canonical point prompt is used instead).
 
+### Measured: masking the background hurt accuracy
+
+The interesting result from building this. Measured with `eval_sweep.py`
+against the deployed pipeline, on **35 held-out HAM10000 images (5 per
+class)**, distinct from the 7 in `sample_images/`:
+
+| mode | correct | accuracy | mean confidence |
+|------|---------|----------|-----------------|
+| masked (background blacked out) | 22/35 | **62.9%** | 0.788 |
+| crop-only (real pixels kept)    | 27/35 | **77.1%** | 0.884 |
+
+Per class (n=5 each):
+
+| class | masked | crop-only |
+|-------|--------|-----------|
+| akiec | 1 | 3 |
+| bcc   | 3 | 5 |
+| bkl   | 4 | 4 |
+| df    | 5 | 5 |
+| mel   | 3 | 4 |
+| nv    | 2 | 2 |
+| vasc  | 4 | 4 |
+
+Crop-only wins or ties in every class, and carries higher mean confidence.
+SAM found a coherent mask on only 24 of the 35 images; the other 11 were
+passed through untouched and are therefore identical in both columns, so the
+whole 5-image swing comes from those 24.
+
+**Caveats, stated plainly:**
+
+- **No true "raw" baseline.** `apply_mask=false` still *crops* to the lesion,
+  so these numbers compare masking against cropping — not against skipping
+  segmentation altogether. Whether SAM helps *at all* here is untested.
+- **The mechanism is a hypothesis.** The likely explanation is a
+  train/inference mismatch: a black-background cutout is unlike anything in
+  the classifier's training data. But that checkpoint's model card says
+  "Training and evaluation data: More information needed", so what it was
+  actually trained on is unknown.
+- **Treat the checkpoint's claimed 99.08% accuracy with suspicion.** Its
+  split is named `60-20-20` over an already-`Augmented-Final` dataset; if
+  augmentation preceded the split, copies of the same lesion could appear in
+  both train and eval. Our measured ~77% is a long way from 99%.
+- `nv` scores 2/5 in both modes — the pipeline is weak on melanocytic nevi
+  regardless of preprocessing.
+
+Fixing the mismatch properly would mean fine-tuning the classifier on
+segmented inputs (what the Himel et al. approach does) — out of scope here,
+so the behaviour is exposed as a toggle instead:
+
+The pipeline exposes all three levels so it can be measured against itself:
+
+| `/analyze` input | behaviour |
+|------------------|-----------|
+| `segment: true, apply_mask: true` (default) | crop to the lesion, black out background |
+| `segment: true, apply_mask: false` | crop to the lesion, keep real pixels |
+| `segment: false` | skip SAM entirely, classify the raw image |
+
+`demo_client.py` runs all three by default; `eval_sweep.py` scores them across
+a directory of labelled images:
+
+```bash
+python fetch_eval_images.py          # one-time: download 35 held-out images
+python eval_sweep.py --url <url> --dir eval_images
+```
+
+`eval_images/` is gitignored — the images are redownloadable, and Flash ships
+the project directory to every worker, where they would never be read.
+`eval_results.json` is committed as the record of the run.
+
 `pipeline.py` is a thin load-balanced orchestrator that calls both endpoints in
 sequence and exposes the whole thing as a single `POST /analyze` call.
 
@@ -68,8 +137,10 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 | `segment_worker.py` | GPU, queue-based (function) | SAM segmentation |
 | `classify_worker.py` | GPU, queue-based (function) | BEiT classification |
 | `pipeline.py` | CPU, load-balanced | Orchestrates segment → classify |
-| `demo_client.py` | local script | Reads an image file, calls `/pipeline/analyze` |
+| `demo_client.py` | local script | Runs one image, writes a markdown report |
+| `eval_sweep.py` | local script | Scores a whole directory across all three modes |
 | `sample_images/` | test fixtures | One real HAM10000 photo per diagnostic class |
+| `eval_images/` | eval set | 35 held-out images (5 per class) for `eval_sweep.py` |
 
 `segment_worker.py` and `classify_worker.py` are plain function endpoints
 (not class-based): `pipeline.py` chains them by directly importing and
@@ -80,23 +151,55 @@ Flash's cross-worker chaining only supports functions — nor can it be called
 from `Endpoint(id=...)` client mode, since that requires speaking an
 undocumented internal wire protocol.
 
-### Model caching: dev vs. deployed
+### Model caching: works deployed, breaks in dev
 
-Both workers cache their model in a module-level global and load it only on
-first use. **This behaves differently in `flash dev` vs. `flash deploy`:**
+Both workers load their model inside the endpoint function on **every call**.
+That's deliberate, and the reason is worth knowing.
+
+`flash-examples/docs/cli/workflows.md` ("Reduce cold starts") recommends
+caching the model in a module-level global:
+
+```python
+_model = None
+
+@Endpoint(...)
+async def infer(payload: dict) -> dict:
+    global _model
+    if _model is None:
+        _model = load_model()
+```
+
+**That pattern behaves differently depending on how you run it:**
 
 | | Module-level globals | Why |
 |---|---|---|
 | `flash dev` | ✗ `NameError` | Live/on-demand provisioning ships only the decorated function's *isolated source*, without surrounding module state (see `runpod_flash.endpoint._is_live_provisioning`) |
 | `flash deploy` | ✓ works | The whole file is baked into the container image and imported normally, so module state persists across requests on a warm worker |
 
-Confirmed in the deployed worker logs: the first request logs
-`Loading weights: 100%|██████████| 314/314` and takes ~12s; the next request
-logs no weight loading at all and takes ~1.4s — roughly a 9x speedup.
+It was tried here and measured in the deployed worker logs: the first request
+logs `Loading weights: 100%|██████████| 314/314` and takes ~12s; the next
+request logs no weight loading at all and takes ~1.4s — roughly a 9x speedup.
 
-The practical consequence is that the caching pattern documented in
-`flash-examples/docs/cli/workflows.md` ("Reduce cold starts") **cannot be
-validated under `flash dev`** — it only works once deployed.
+**It was then removed on purpose.** Keeping it would have meant `flash dev`
+raising `NameError` on every call, breaking local development, in exchange
+for a speedup that this demo doesn't need. The tradeoff is that every
+`/analyze` call now pays the model load. If you want the speedup in a
+deployed-only setup, add the globals back — just don't expect `flash dev` to
+work afterwards.
+
+This behaviour appears to be undocumented. `docs.runpod.io/flash/apps/build-app`
+doesn't mention it, and the only `global` in `docs/cli/` is the snippet
+recommending the pattern. The one place stating the underlying rule —
+"only local variables, parameters, and internal imports work" — is
+`flash-examples/CLAUDE.md`, which is auto-generated repo analysis rather than
+documentation. It was determined here by testing (three `NameError`s: a module
+constant, the model globals, and a module-level `import os`), then traced to
+`runpod_flash/stubs/live_serverless.py`, which extracts the decorated
+function's source via AST and ships it in isolation.
+
+The same constraint is why the worker function bodies are self-contained
+rather than decomposed into module-level helpers — those helpers would be
+invisible to the function under `flash dev` for exactly the same reason.
 
 ### Demo
 
@@ -106,12 +209,32 @@ python demo_client.py sample_images/mel_ISIC_0024351.jpg
 
 # against the deployed pipeline (needs RUNPOD_API_KEY in env or .env)
 python demo_client.py sample_images/mel_ISIC_0024351.jpg \
-  --url https://uvu4lc1mmlihc0.api.runpod.ai --out-dir results
+  --url https://uvu4lc1mmlihc0.api.runpod.ai
 ```
 
-`demo_client.py` prints the JSON result and writes the masked lesion crop to
-`<image>_segmented.png`, so you can show the original and what SAM actually
-produced side by side.
+By default `demo_client.py` runs the image **all three ways** — masked,
+crop-only, and raw (SAM bypassed) — and writes a self-contained markdown
+report to `results/`:
+
+```
+results/
+├── <stem>_report.md      # summary, metrics, comparison, class probabilities
+├── <stem>_original.jpg   # copied so the report renders standalone
+├── <stem>_masked.png     # background blacked out
+├── <stem>_crop_only.png  # cropped to the lesion, real pixels kept
+└── <stem>_raw.png        # SAM bypassed entirely
+```
+
+The report contains the prediction from each mode against the expected class
+(taken from the filename), SAM's selection metrics, the images side by side,
+and the full 7-class probability breakdown — so a single command produces the
+whole comparison. Add `--single` (optionally with `--no-mask`) to make just
+one call.
+
+`results/` is gitignored, since it's generated output.
+
+It also retries through cold-start 502s automatically, so the first call of a
+demo won't fail while the GPU workers warm up.
 
 ### Deployed endpoints
 
@@ -129,18 +252,30 @@ Two differences from local `flash dev` to watch for:
   (`/analyze`), while `flash dev` namespaces them under the endpoint name
   (`/pipeline/analyze`). `demo_client.py` handles both automatically.
 
-**Cold-start caveat for live demos:** the LB gateway times out around ~40s, but
-a fully cold `/analyze` (both GPU workers provisioning, plus downloading SAM
-and BEiT) takes longer and returns a 502. Warm calls complete in ~5s. Send one
-throwaway request to warm the workers before presenting.
+**Cold-start caveat for live demos:** a fully cold `/analyze` (both GPU
+workers provisioning, plus downloading SAM and BEiT) consistently failed with
+a 502 at around 40-45 seconds, which looks like a gateway timeout ahead of the
+worker. Once the workers are up, calls succeed. `demo_client.py` and
+`eval_sweep.py` retry through these automatically; if you're using `curl`,
+send a throwaway request first to get the workers provisioned.
 
 ### Test the Pipeline
 
 ```bash
-# Full pipeline: segment + classify in one call
+# Full pipeline: segment + classify in one call (masked, the default)
 curl -X POST http://localhost:8888/pipeline/analyze \
   -H "Content-Type: application/json" \
   -d '{"input_data": {"image_base64": "<base64-encoded-image>"}}'
+
+# Crop to the lesion without blacking out the background
+curl -X POST http://localhost:8888/pipeline/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"input_data": {"image_base64": "<...>", "apply_mask": false}}'
+
+# Skip SAM entirely and classify the raw image
+curl -X POST http://localhost:8888/pipeline/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"input_data": {"image_base64": "<...>", "segment": false}}'
 
 # Individual stages
 curl -X POST http://localhost:8888/segment_worker/runsync \
@@ -149,12 +284,13 @@ curl -X POST http://localhost:8888/segment_worker/runsync \
 
 curl -X POST http://localhost:8888/classify_worker/runsync \
   -H "Content-Type: application/json" \
-  -d '{"input": {"input_data": {"image_base64": "<base64-encoded-masked-lesion>"}}}'
+  -d '{"input": {"input_data": {"image_base64": "<base64-encoded-lesion>"}}}'
 ```
 
-`segment_worker` returns `segmented_image_base64` (the masked lesion) plus
-`segmentation_applied`, `bbox`, `score`, `coverage` and `solidity` — feed that
-image straight into `classify_worker`.
+`segment_worker` returns `segmented_image_base64` (the lesion image, masked
+when `apply_mask` is true) plus `segmentation_applied`, `mask_applied`,
+`bbox`, `score`, `coverage` and `solidity` — feed that image straight into
+`classify_worker`.
 
 ### GPU Configuration
 
@@ -215,14 +351,17 @@ curl -X POST http://localhost:8888/segment_worker/runsync \
   -d '{"input": {"input_data": {"image_base64": "'"$(base64 -i sample_images/bcc_ISIC_0024431.jpg)"'"}}}'
 ```
 
-The first call to a given worker takes longer (a real GPU is being spun up
-and SAM/BEiT are downloaded from Hugging Face); subsequent calls to a warm
-worker are faster, though each call currently still reloads the model
-in-process (see the caching note above).
+The first call to a given worker takes longest (a real GPU is being spun up
+and SAM/BEiT downloaded from Hugging Face). Later calls skip the download but
+still reload the model into memory each time — see the caching note above for
+why that's deliberate.
 
-Press **Ctrl+C** to stop the server — this cleans up the Runpod endpoints
-that `flash dev` provisioned during the session, so nothing keeps running
-(and billing) after you stop.
+Press **Ctrl+C** to stop the server. Flash's own docs say this cleans up the
+endpoints provisioned during the session — but **if the process is killed
+rather than interrupted, cleanup does not run and the endpoints are left
+behind, still billable.** That happened repeatedly while building this. Check
+with `flash undeploy list` and remove strays with
+`flash undeploy <name> --force`.
 
 ### Checking on things independently
 
@@ -255,9 +394,14 @@ you actually call them.
 runpod_trial/
 ├── segment_worker.py   # GPU worker: SAM lesion segmentation
 ├── classify_worker.py  # GPU worker: BEiT HAM10000 classification
-├── pipeline.py          # LB orchestrator: segment -> classify
-├── demo_client.py      # Local script: call the pipeline with an image file
-├── sample_images/      # Real HAM10000 test images, one per class
+├── pipeline.py         # LB orchestrator: segment -> classify
+├── demo_client.py      # Local script: one image -> markdown report
+├── eval_sweep.py       # Local script: score a directory across all modes
+├── fetch_eval_images.py # Local script: download the eval set
+├── sample_images/      # 7 HAM10000 images, one per class (demo fixtures)
+├── eval_images/        # 35 held-out images, 5 per class (gitignored)
+├── eval_results.json   # Raw sweep output, committed as the record
+├── results/            # Generated reports and images (gitignored)
 ├── .env.example        # Environment variable template
 ├── requirements.txt    # Python dependencies
 └── README.md
@@ -372,5 +516,59 @@ LOG_LEVEL=INFO         # Logging level (default: INFO)
 ## Deploy
 
 ```bash
-flash deploy
+flash deploy                    # deploy to the default environment
+flash deploy --env staging      # deploy to a named environment
 ```
+
+### Read the whole output
+
+A successful deploy builds and uploads the artifact every time, as documented:
+
+```
+✓ installed 3 packages  60.9s
+✓ built runpod_trial  54 files, 3 deps, 85.2 MB
+✓ uploaded  85.2 MB  5.0s
+✓ deployed to production  3.6s
+```
+
+Don't pipe this through `tail -n` with a small `n`. The endpoint table and
+example `curl` that follow run to ~14 more lines, so `tail -12` clips the
+`built`/`uploaded` lines and makes a perfectly normal deploy look like it
+skipped the build. (That misreading cost real debugging time here.) Use
+`tee` if you want to keep the log:
+
+```bash
+flash deploy 2>&1 | tee /tmp/deploy.log
+```
+
+### Rollouts are gradual — use environments to iterate
+
+A deploy creates a **new endpoint version**. Existing workers keep serving the
+previous version and are marked `isStale: true`; they're replaced as they
+cycle out. That's intentional zero-downtime rollout, not a bug — but it means
+**a fresh deploy is not immediately live**, which is surprising the first time
+you hit it (`✓ deployed` prints, and the old code answers your next request).
+
+Don't fight it by forcing workers down and back up. Runpod's recommended
+pattern is to **deploy to a separate environment** and test there:
+
+```bash
+flash env list                  # show environments
+flash env create staging        # one-time
+flash deploy --env staging      # deploy without touching production
+flash env get staging           # URLs for the staging endpoints
+```
+
+Then promote to production once you're happy, and let the rollout proceed
+normally.
+
+### Verify what's actually live
+
+```bash
+flash app list                  # apps and their environments
+flash env get production        # endpoint IDs and URLs
+```
+
+Endpoint versions and per-worker staleness are visible in the Runpod console
+(Serverless → the endpoint → Workers), which is the quickest way to see
+whether a rollout has finished.
