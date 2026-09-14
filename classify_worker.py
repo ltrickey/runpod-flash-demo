@@ -1,7 +1,23 @@
-# gpu serverless worker -- classifies a segmented skin lesion using BEiT
-# fine-tuned on HAM10000 (7-class: akiec, bcc, bkl, df, mel, nv, vasc).
+# gpu serverless worker -- classifies a lesion image with the ViT fine-tuned
+# by train_worker.py (7-class: akiec, bcc, bkl, df, mel, nv, vasc).
 # run with: flash dev
-# test directly: python classify_worker.py
+#
+# Serves either trained arm, selected per request. The pipeline pairs each
+# model with the preprocessing it was trained for -- a masked-trained model
+# only ever sees masked input, a raw-trained model only raw. Mixing them
+# measures a distribution mismatch rather than the preprocessing itself, and
+# would make masking look worse than it fairly is.
+#
+# Default is the raw arm: masking costs 14.2 points of balanced accuracy that
+# retraining cannot recover (see results/training_report.md).
+#
+# Weights are read from the network volume rather than Hugging Face, which is
+# why this endpoint carries volume= and datacenter=. The volume is
+# datacenter-scoped, so attaching it pins inference to EU-RO-1 instead of the
+# eleven datacenters this endpoint could otherwise schedule across. The
+# alternative -- downloading the weights and baking them into the deploy
+# artifact -- avoids the pin but adds ~350MB to every deploy and a manual
+# re-fetch after each retrain.
 #
 # The model is loaded inside the function on every call. Caching it in a
 # module-level global does speed this up (measured ~12s -> ~1.4s once warm),
@@ -11,7 +27,14 @@
 # it's left out of the code here to keep both paths working and the worker
 # simple. The same constraint is why this function body is self-contained
 # rather than calling module-level helpers.
-from runpod_flash import Endpoint, GpuGroup
+from runpod_flash import DataCenter, Endpoint, GpuGroup, NetworkVolume
+
+# same volume train_worker.py writes checkpoints to, matched by name
+volume = NetworkVolume(
+    name="lesion-training",
+    size=50,
+    datacenter=DataCenter.EU_RO_1,
+)
 
 
 @Endpoint(
@@ -21,15 +44,19 @@ from runpod_flash import Endpoint, GpuGroup
     # one worker always warm and skip the first-request cold start/model load
     # at the cost of continuous GPU billing.
     idle_timeout=300,
+    volume=volume,
+    datacenter=DataCenter.EU_RO_1,
     dependencies=["transformers", "pillow"],
 )
 async def classify(input_data: dict) -> dict:
     """
-    Classify a segmented lesion image with the HAM10000-finetuned BEiT model.
+    Classify a lesion image with the fine-tuned ViT.
 
     Input:
-        image_base64: str - base64-encoded segmented lesion image (e.g. the
-            output of segment_worker.segment)
+        image_base64: str - base64-encoded lesion image, normally the output
+            of segment_worker.segment
+        model_variant: "raw" | "masked" - which trained arm to load
+            (default "raw")
 
     Returns:
         label: str - predicted HAM10000 diagnostic class
@@ -38,17 +65,31 @@ async def classify(input_data: dict) -> dict:
     """
     import base64
     import io
+    import os
 
     import torch
     from PIL import Image
     from transformers import AutoImageProcessor, AutoModelForImageClassification
 
+    variant = input_data.get("model_variant", "raw")
+    if variant not in ("raw", "masked"):
+        return {"status": "error", "error": f"unknown model_variant: {variant}"}
+    checkpoint = f"/runpod-volume/models/vit-base-p32-{variant}"
+
     try:
-        model_id = "ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20"
+        if not os.path.isdir(checkpoint):
+            return {
+                "status": "error",
+                "error": (
+                    f"no checkpoint at {checkpoint} -- run train_worker "
+                    "(stage=prepare, then stage=train) to create it"
+                ),
+            }
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = AutoModelForImageClassification.from_pretrained(model_id).to(device)
+        model = AutoModelForImageClassification.from_pretrained(checkpoint).to(device)
         model.eval()
-        processor = AutoImageProcessor.from_pretrained(model_id)
+        processor = AutoImageProcessor.from_pretrained(checkpoint)
 
         image_bytes = base64.b64decode(input_data["image_base64"])
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -64,6 +105,7 @@ async def classify(input_data: dict) -> dict:
 
         return {
             "status": "success",
+            "model_variant": variant,
             "label": id2label[top_idx],
             "confidence": float(probs[top_idx]),
             "all_scores": {id2label[i]: float(probs[i]) for i in range(len(probs))},
@@ -71,27 +113,3 @@ async def classify(input_data: dict) -> dict:
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
-if __name__ == "__main__":
-    import asyncio
-    import base64
-    import io
-
-    from PIL import Image, ImageDraw
-
-    def make_test_image() -> str:
-        img = Image.new("RGB", (224, 224), (224, 172, 142))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse((60, 60, 164, 164), fill=(90, 60, 45))
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    test_payload = {"image_base64": make_test_image()}
-    print("Testing BEiT classify worker with a synthetic lesion image")
-    result = asyncio.run(classify(test_payload))
-    if result["status"] == "success":
-        print(f"Success! label={result['label']} confidence={result['confidence']:.4f}")
-    else:
-        print(f"Error: {result}")

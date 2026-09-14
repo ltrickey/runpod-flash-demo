@@ -1,9 +1,10 @@
 """Evaluation sweep: run every image in a directory through the pipeline both
-ways (masked and crop-only) and report accuracy per mode.
+arms -- masked (SAM + masked-trained model) and raw (no SAM +
+raw-trained model) -- and report accuracy per arm.
 
-Exists to check whether the masked-vs-crop-only accuracy difference observed
-on the original 7 sample images holds on a larger set. Writes raw results to
-JSON so the numbers can be re-derived without re-running (which costs GPU time).
+Answers whether segmentation earns its place in the pipeline at all. Writes
+raw results to JSON so the numbers can be re-derived without re-running
+(which costs GPU time).
 
 usage:
     python eval_sweep.py --url https://<id>.api.runpod.ai --dir eval_images
@@ -18,16 +19,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from demo_client import call_pipeline, resolve_target
+from pipeline_client import ARMS, call_pipeline, resolve_target
 
 
-# (label, apply_mask, segment) -- "raw" bypasses SAM entirely, which is the
-# baseline that shows whether segmentation earns its place at all.
-MODES = (
-    ("masked", True, True),
-    ("crop-only", False, True),
-    ("raw", False, False),
-)
+
 
 
 def evaluate(image_paths, url, path, headers):
@@ -40,8 +35,8 @@ def evaluate(image_paths, url, path, headers):
         image_base64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
 
         record = {"expected": expected, "modes": {}}
-        for label, apply_mask, segment in MODES:
-            result = call_pipeline(url, path, headers, image_base64, apply_mask, segment)
+        for label in ARMS:
+            result = call_pipeline(url, path, headers, image_base64, label)
             record["modes"][label] = {
                 "prediction": result["label"],
                 "confidence": result["confidence"],
@@ -52,7 +47,7 @@ def evaluate(image_paths, url, path, headers):
         summary = "  ".join(
             f"{label}={record['modes'][label]['prediction']:5s}"
             f"({record['modes'][label]['confidence']:.3f})"
-            for label, _, _ in MODES
+            for label in ARMS
         )
         print(f"[{index}/{len(image_paths)}] {stem:26s} exp={expected:5s} {summary}")
 
@@ -85,7 +80,9 @@ def main():
     parser.add_argument("--url", required=True, help="Base URL of the deployed Flash server")
     parser.add_argument("--dir", default="eval_images", help="Directory of labelled images")
     parser.add_argument("--path", default=None, help="Override the route path")
-    parser.add_argument("--out", default="eval_results.json", help="Where to write raw results")
+    parser.add_argument(
+        "--out", default="results/eval_results.json", help="Where to write raw results"
+    )
     args = parser.parse_args()
 
     load_dotenv()
@@ -104,7 +101,7 @@ def main():
     print(f"\n{'=' * 58}")
     print(f"{n} images | SAM found a coherent mask on {segmented_count}")
     print(f"{'=' * 58}")
-    mode_labels = [label for label, _, _ in MODES]
+    mode_labels = list(ARMS)
 
     print(f"{'mode':<12} {'correct':>12} {'accuracy':>10} {'mean conf':>12}")
     for mode in mode_labels:

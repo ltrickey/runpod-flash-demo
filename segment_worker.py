@@ -1,6 +1,5 @@
 # gpu serverless worker -- segments a skin lesion from an image using SAM.
 # run with: flash dev
-# test directly: python segment_worker.py
 #
 # The model is loaded inside the function on every call. Caching it in a
 # module-level global does speed this up (measured ~12s -> ~1.4s once warm),
@@ -42,26 +41,15 @@ async def segment(input_data: dict) -> dict:
     unmasked with segmentation_applied=False, rather than handing the
     classifier garbage.
 
-    On apply_mask: blacking out the background pushes the image off the
-    distribution the classifier was fine-tuned on (raw dermoscopy photos),
-    which measurably *hurts* accuracy -- on the sample set, masking dropped
-    7/7 correct to 5/7 and lowered confidence on every image it touched.
-    apply_mask=False keeps real pixels and only crops to the lesion bbox,
-    which is the better-performing mode. The toggle exists so the two can be
-    compared directly.
-
     Input:
         image_base64: str - base64-encoded source image (JPEG/PNG)
-        apply_mask: bool - black out non-lesion pixels (default True). When
-            False, crop to the mask's bounding box but keep real pixels.
 
     Returns:
         segmented_image_base64: str - base64-encoded PNG of the lesion,
-            cropped to the mask's bounding box, with non-lesion pixels
-            blacked out when apply_mask is True
+            with non-lesion pixels blacked out, at the original framing
+            (not cropped)
         segmentation_applied: bool - False if no coherent mask was found and
             the original image was passed through
-        mask_applied: bool - whether non-lesion pixels were actually blacked out
         bbox: [x0, y0, x1, y1] - bounding box of the mask within the source image
         score: float - SAM's IoU confidence score for the chosen mask
         coverage / solidity: float - the two selection metrics, for inspection
@@ -75,7 +63,6 @@ async def segment(input_data: dict) -> dict:
     from transformers import SamModel, SamProcessor
 
     min_coverage, max_coverage, min_solidity = 0.03, 0.90, 0.40
-    apply_mask = input_data.get("apply_mask", True)
 
     try:
         model_id = "facebook/sam-vit-base"
@@ -124,19 +111,27 @@ async def segment(input_data: dict) -> dict:
 
         if viable:
             score, mask, bbox, coverage, solidity = max(viable, key=lambda c: c[0])
-            if apply_mask:
-                pixels = np.array(image)
-                pixels[~mask] = 0
-                Image.fromarray(pixels).crop(bbox).save(buffer, format="PNG")
-            else:
-                image.crop(bbox).save(buffer, format="PNG")
+            # Black out non-lesion pixels but keep the original framing. NOT
+            # cropped to the bbox: cropping would change scale and framing as
+            # well, so masked vs raw would differ in two ways at once and the
+            # comparison could not attribute any difference to masking. The
+            # bbox is still reported as metadata.
+            #
+            # Lesion pixels keep their RGB. Himel et al.'s wording ("converted
+            # to binary masking", white = lesion / black = everything else)
+            # more likely means the ViT is fed the bare silhouette, with all
+            # colour discarded. Keeping the pixels is the more generous
+            # reading: it hands the classifier strictly more information than
+            # a silhouette would, so it gives segmentation its best shot.
+            # README covers both readings.
+            pixels = np.array(image)
+            pixels[~mask] = 0
+            Image.fromarray(pixels).save(buffer, format="PNG")
             segmentation_applied = True
-            mask_applied = apply_mask
         else:
             score, bbox, coverage, solidity = 0.0, (0, 0, width, height), 1.0, 1.0
             image.save(buffer, format="PNG")
             segmentation_applied = False
-            mask_applied = False
 
         segmented_image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
@@ -144,7 +139,6 @@ async def segment(input_data: dict) -> dict:
             "status": "success",
             "segmented_image_base64": segmented_image_base64,
             "segmentation_applied": segmentation_applied,
-            "mask_applied": mask_applied,
             "bbox": list(bbox),
             "score": score,
             "coverage": coverage,
@@ -153,27 +147,3 @@ async def segment(input_data: dict) -> dict:
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
-if __name__ == "__main__":
-    import asyncio
-    import base64
-    import io
-
-    from PIL import Image, ImageDraw
-
-    def make_test_image() -> str:
-        img = Image.new("RGB", (256, 256), (224, 172, 142))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse((90, 90, 166, 166), fill=(90, 60, 45))
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    test_payload = {"image_base64": make_test_image()}
-    print("Testing SAM segment worker with a synthetic lesion image")
-    result = asyncio.run(segment(test_payload))
-    if result["status"] == "success":
-        print(f"Success! bbox={result['bbox']} score={result['score']:.4f}")
-    else:
-        print(f"Error: {result}")
