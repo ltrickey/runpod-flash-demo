@@ -215,7 +215,8 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 | `eval_sweep.py` | local script | Scores a whole directory across both arms |
 | `pipeline_client.py` | local module | Shared request/retry helpers for the two clients above |
 | `training_report.py` | local script | Builds `results/training_report.md` from the stage outputs |
-| `train_worker.py` | GPU, queue-based (function) | Fine-tunes masked and raw arms on a network volume |
+| `train_worker.py` | GPU, queue-based (function) | Endpoint + stage dispatch: fine-tunes the three arms on a network volume |
+| `lesion_training/` | package | The stages themselves: data prep, ViT training and scoring, segmentation IoU |
 | `train_client.py` | local script | Submits training jobs and polls to completion |
 | `fetch_eval_images.py` | local script | Downloads the eval set |
 | `sample_images/` | test fixtures | One real HAM10000 photo per diagnostic class |
@@ -266,7 +267,7 @@ async def infer(payload: dict) -> dict:
 
 | | Module-level globals | Why |
 |---|---|---|
-| `flash dev` | ✗ `NameError` | Live/on-demand provisioning ships only the decorated function's *isolated source*, without surrounding module state (see `runpod_flash.endpoint._is_live_provisioning`) |
+| `flash dev` | ✗ `NameError` | Live/on-demand provisioning ships the decorated function's source (plus any local modules it imports), without surrounding module state (see `runpod_flash.endpoint._is_live_provisioning`) |
 | `flash deploy` | ✓ works | The whole file is baked into the container image and imported normally, so module state persists across requests on a warm worker |
 
 It was tried here and measured in the deployed worker logs: the first request
@@ -290,9 +291,15 @@ constant, the model globals, and a module-level `import os`), then traced to
 `runpod_flash/stubs/live_serverless.py`, which extracts the decorated
 function's source via AST and ships it in isolation.
 
-The same constraint is why the worker function bodies are self-contained
-rather than decomposed into module-level helpers — those helpers would be
-invisible to the function under `flash dev` for exactly the same reason.
+That constraint is about module-level *state*, not code organisation. `flash dev`
+ships the function's source together with the local modules that source
+imports — Flash resolves the import closure in
+`runpod_flash/stubs/local_modules.py` — so shared logic can live in a separate
+module imported inside the function body. `train_worker.py` does exactly that
+with `lesion_training/`; running Flash's resolver on it lists all six package
+files. What stays invisible is anything defined at module level in the
+endpoint's own file: a helper function there, or a global like the cached model
+above.
 
 ### Demo
 
@@ -546,7 +553,8 @@ runpod_trial/
 ├── segment_worker.py   # GPU worker: SAM lesion segmentation
 ├── classify_worker.py  # GPU worker: ViT HAM10000 classification
 ├── pipeline.py         # LB orchestrator: segment -> classify
-├── train_worker.py     # GPU worker: fine-tunes the masked and raw arms
+├── train_worker.py     # GPU worker: stage dispatch for the three training arms
+├── lesion_training/    # train_worker's stages: data prep, ViT, segmentation IoU
 ├── demo_client.py      # Local script: one image through both arms
 ├── eval_sweep.py       # Local script: score a directory across both arms
 ├── pipeline_client.py  # Local module: shared request/retry helpers
