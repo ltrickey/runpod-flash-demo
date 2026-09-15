@@ -250,7 +250,7 @@ pin but adds ~350MB to every deploy, or [fetching weights from S3](https://docs.
 Both workers load their model inside the endpoint function on **every call**.
 That's deliberate, and the reason is worth knowing.
 
-[flash-examples/docs/cli/workflows.md](https://github.com/runpod/flash-examples/blob/main/docs/cli/workflows.md) ("Reduce cold starts") recommends
+[flash-examples/docs/cli/workflows.md](https://github.com/runpod/flash-examples/blob/2b4592975337d1d994932abdc1d2d12adf92d353/docs/cli/workflows.md?plain=1#L1570-L1585) (Troubleshooting → "Issue 6: Performance Issues" → "B. Optimize startup time") recommends
 caching the model in a module-level global:
 
 ```python
