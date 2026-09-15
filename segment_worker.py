@@ -4,11 +4,12 @@
 # The model is loaded inside the function on every call. Caching it in a
 # module-level global does speed this up (measured ~12s -> ~1.4s once warm),
 # but only when deployed -- under `flash dev` it raises NameError, because
-# live provisioning ships the decorated function's source in isolation
-# without the surrounding module. That split is written up in the README;
-# it's left out of the code here to keep both paths working and the worker
-# simple. The same constraint is why this function body is self-contained
-# rather than calling module-level helpers.
+# live provisioning ships the decorated function's source without the
+# surrounding module's state. That split is written up in the README; caching
+# is left out here to keep the worker simple. A cache in a separate module,
+# imported inside the function body, would avoid the NameError (not tested
+# here). The same constraint rules out helpers defined at module level in
+# this file.
 from runpod_flash import Endpoint, GpuGroup
 
 

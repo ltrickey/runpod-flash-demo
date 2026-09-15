@@ -21,14 +21,15 @@
 # re-fetch after each retrain.
 #
 # The model is loaded inside the function on every call. Caching it in a
-# module-level global does speed this up (measured ~12s -> ~1.4s once warm),
-# but only when deployed -- under `flash dev` it raises NameError, because
-# live provisioning ships the decorated function's source without the
-# surrounding module's state. That split is written up in the README; it's
-# left out of the code here to keep both paths working and the worker simple.
-# The same constraint rules out helpers defined at module level in this file.
-# Shared code would have to live in a separate module imported inside the
-# function body, the way train_worker.py uses lesion_training/.
+# module-level global does speed things up (measured on the SAM worker:
+# ~12s -> ~1.4s once warm), but only when deployed -- under `flash dev` it
+# raises NameError, because live provisioning ships the decorated function's
+# source without the surrounding module's state. That split is written up in
+# the README; caching is left out here to keep the worker simple. The same
+# constraint rules out helpers defined at module level in this file. A cache,
+# or any shared code, can instead live in a separate module imported inside
+# the function body -- the way train_worker.py uses lesion_training/ -- though
+# a module-level cache has not been tested here.
 from runpod_flash import DataCenter, Endpoint, GpuGroup, NetworkVolume
 
 # same volume train_worker.py writes checkpoints to, matched by name

@@ -7,5 +7,6 @@
     segmentation_eval  IoU of SAM's masks against the reference masks
 
 Imports within the package are absolute (`from lesion_training import ...`).
-Flash's local-module resolver rejects relative imports.
+Flash's local-module resolver follows relative imports too, but raises if one
+can't be resolved to a local file; absolute imports keep that path simple.
 """

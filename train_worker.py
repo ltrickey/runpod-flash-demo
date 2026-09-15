@@ -38,10 +38,11 @@
 # inference endpoints.
 #
 # This file is only the endpoint and stage dispatch; the stages live in
-# lesion_training/. They're imported inside the function body because that is
-# what Flash follows: `flash deploy` bundles the project directory, and
-# `flash dev` ships the function source plus the local modules it imports.
-# Module-level state in this file would reach neither.
+# lesion_training/. They're imported inside the function body so both paths
+# get them: `flash deploy` bundles the whole project directory, and
+# `flash dev` ships the function source plus the local modules that source
+# imports. Module-level state in this file would not reach a `flash dev`
+# worker.
 #
 # Stages are selectable so the expensive SAM pass is not repeated on every
 # training run:

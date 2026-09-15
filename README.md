@@ -245,7 +245,7 @@ first to end up `THROTTLED` when the account's worker quota was tight. The
 alternative is baking the weights into the deploy artifact, which avoids the
 pin but adds ~350MB to every deploy, or [fetching weights from S3](https://docs.runpod.io/storage/s3-api).  For this demo, pinning one datacenter made sense.
 
-### Model caching: works deployed, breaks in dev
+### Model caching: the documented pattern breaks in dev
 
 Both workers load their model inside the endpoint function on **every call**.
 That's deliberate, and the reason is worth knowing.
@@ -265,7 +265,7 @@ async def infer(payload: dict) -> dict:
 
 **That pattern behaves differently depending on how you run it:**
 
-| | Module-level globals | Why |
+| | Globals in the endpoint file | Why |
 |---|---|---|
 | `flash dev` | ✗ `NameError` | Live/on-demand provisioning ships the decorated function's source (plus any local modules it imports), without surrounding module state (see `runpod_flash.endpoint._is_live_provisioning`) |
 | `flash deploy` | ✓ works | The whole file is baked into the container image and imported normally, so module state persists across requests on a warm worker |
@@ -274,14 +274,30 @@ It was tried here and measured in the deployed worker logs: the first request
 logs `Loading weights: 100%|██████████| 314/314` and takes ~12s; the next
 request logs no weight loading at all and takes ~1.4s — roughly a 9x speedup.
 
-**It was then removed on purpose.** Keeping it would have meant `flash dev`
+**It was then removed on purpose.** In that form it would have meant `flash dev`
 raising `NameError` on every call, breaking local development, in exchange
 for a speedup that this demo doesn't need. The tradeoff is that every
-`/analyze` call now pays the model load. If you want the speedup in a
-deployed-only setup, add the globals back — just don't expect `flash dev` to
-work afterwards.
+`/analyze` call now pays the model load.
 
-This behaviour appears to be undocumented. `docs.runpod.io/flash/apps/build-app`
+That doesn't make caching and `flash dev` incompatible — only a cache stored as
+a global in the endpoint file (see below for why). A cache in a separate
+module, imported inside the function body, should work on both paths. It has
+not been tested here:
+
+- **No `NameError`.** `flash dev` ships the local modules the function imports.
+- **The cache should persist on a warm dev worker, at least for load-balanced
+  endpoints.** Flash's load-balancer runtime (`runpod_flash/runtime/lb_handler.py`
+  and `module_loader.py`) writes the shipped modules to a temp directory for
+  each request and removes it afterwards, but never clears `sys.modules` — so a
+  module that's already imported, and the model cached inside it, is reused.
+  The code that runs *queue-based* endpoints under `flash dev` ships inside the
+  worker image rather than the client package, so for `segment_worker` and
+  `classify_worker` this is unverified.
+- **Side effect:** for the same reason, a warm dev worker would likely keep using
+  the *old* version of that helper module after you edit it, until the worker
+  restarts.
+
+The `NameError` behaviour appears to be undocumented. `docs.runpod.io/flash/apps/build-app`
 doesn't mention it, and the only `global` in `docs/cli/` is the snippet
 recommending the pattern. The one place stating the underlying rule —
 "only local variables, parameters, and internal imports work" — is
@@ -289,7 +305,7 @@ recommending the pattern. The one place stating the underlying rule —
 documentation. It was determined here by testing (three `NameError`s: a module
 constant, the model globals, and a module-level `import os`), then traced to
 `runpod_flash/stubs/live_serverless.py`, which extracts the decorated
-function's source via AST and ships it in isolation.
+function's source via AST and ships it without the surrounding module's state.
 
 That constraint is about module-level *state*, not code organisation. `flash dev`
 ships the function's source together with the local modules that source
