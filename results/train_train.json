@@ -1,0 +1,45 @@
+{
+  "stage": "train",
+  "status": "success",
+  "train": {
+    "masked": {
+      "base_model": "google/vit-base-patch32-224-in21k",
+      "epochs": 10,
+      "fold_sizes": {
+        "test": 408,
+        "train": 1760,
+        "validation": 380
+      },
+      "output_dir": "/runpod-volume/models/vit-base-p32-masked",
+      "test_accuracy": 0.6372549019607843,
+      "test_balanced_accuracy": 0.5630128392248018,
+      "variant": "masked"
+    },
+    "raw": {
+      "base_model": "google/vit-base-patch32-224-in21k",
+      "epochs": 10,
+      "fold_sizes": {
+        "test": 408,
+        "train": 1760,
+        "validation": 380
+      },
+      "output_dir": "/runpod-volume/models/vit-base-p32-raw",
+      "test_accuracy": 0.7377450980392157,
+      "test_balanced_accuracy": 0.7012390598165718,
+      "variant": "raw"
+    },
+    "gtmasked": {
+      "base_model": "google/vit-base-patch32-224-in21k",
+      "epochs": 10,
+      "fold_sizes": {
+        "test": 408,
+        "train": 1760,
+        "validation": 380
+      },
+      "output_dir": "/runpod-volume/models/vit-base-p32-gtmasked",
+      "test_accuracy": 0.6691176470588235,
+      "test_balanced_accuracy": 0.6282600190487877,
+      "variant": "gtmasked"
+    }
+  }
+}

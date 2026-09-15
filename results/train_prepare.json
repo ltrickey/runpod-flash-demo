@@ -1,0 +1,20 @@
+{
+  "prepare": {
+    "images": 2548,
+    "masked": 1816,
+    "passed_through": 732,
+    "per_class": {
+      "akiec": 315,
+      "bcc": 487,
+      "bkl": 500,
+      "df": 110,
+      "mel": 500,
+      "nv": 500,
+      "vasc": 136
+    },
+    "per_class_cap": 500,
+    "sampling": "per_class"
+  },
+  "stage": "prepare",
+  "status": "success"
+}

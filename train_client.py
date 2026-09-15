@@ -8,11 +8,19 @@ usage:
     # quick smoke test: mask 14 images, prove SAM + volume writes work
     python train_client.py --stage prepare --n-images 14
 
-    # full preprocessing pass over HAM10000 (~10k images, resumable)
+    # preprocessing pass over the source dataset's train split -- 9,577
+    # images with the default --n-images 0 (resumable). The results in this
+    # repo used --n-images 3500, i.e. at most 500 per class (2,548 images).
     python train_client.py --stage prepare
 
-    # train both arms from the prepared dataset
+    # backfill the ground-truth-masked variant (no SAM, minutes not hours)
+    python train_client.py --stage prepare_gt
+
+    # train all three arms from the prepared dataset
     python train_client.py --stage train
+
+    # train just the ground-truth arm
+    python train_client.py --stage train --variants gtmasked
 
 Needs TRAIN_ENDPOINT_ID and RUNPOD_API_KEY in the environment or .env.
 """
@@ -73,8 +81,24 @@ def poll(endpoint_id, headers, job_id):
 
 def main():
     parser = argparse.ArgumentParser(description="Run a train_worker job and wait for it.")
-    parser.add_argument("--stage", default="both", choices=["prepare", "train", "both", "evaluate"])
-    parser.add_argument("--n-images", type=int, default=0, help="0 means all (~10k)")
+    parser.add_argument(
+        "--stage",
+        default="both",
+        choices=[
+            "prepare",
+            "prepare_gt",
+            "train",
+            "both",
+            "evaluate",
+            "segmentation_iou",
+        ],
+    )
+    parser.add_argument(
+        "--n-images",
+        type=int,
+        default=0,
+        help="0 means the whole train split (9,577); N caps at N/7 per class",
+    )
     # Default to None and omit from the payload rather than duplicating the
     # worker's defaults here. Two copies of a default is a trap: the client
     # silently overrides the worker, so changing the worker appears to have
@@ -83,8 +107,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
         "--variants",
-        default="masked,raw",
-        help="Comma-separated training arms (default both)",
+        default="masked,raw,gtmasked",
+        help="Comma-separated training arms (default all three)",
     )
     parser.add_argument(
         "--reset",
@@ -134,6 +158,24 @@ def main():
         results_dir = Path("results")
         results_dir.mkdir(parents=True, exist_ok=True)
         saved = results_dir / f"train_{args.stage}.json"
+
+        # Merge per-arm training results instead of overwriting. Training one
+        # arm at a time is normal (--variants gtmasked), and a blind write
+        # would discard the other arms' scores -- which are expensive to
+        # reproduce and are exactly what the comparison needs.
+        if args.stage == "train" and saved.exists():
+            try:
+                existing = json.loads(saved.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+            if isinstance(existing.get("train"), dict) and isinstance(
+                output.get("train"), dict
+            ):
+                merged = dict(existing["train"])
+                merged.update(output["train"])
+                output = {**existing, **output, "train": merged}
+                print(f"merged arms: {', '.join(sorted(merged))}")
+
         saved.write_text(json.dumps(output, indent=2))
         print(f"\nsaved {saved}")
 

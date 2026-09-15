@@ -56,10 +56,11 @@ Under reading (a) the classifier would be separating melanoma from naevi
 without ever seeing pigment, which is a far stronger claim than this repo
 tests.
 
-Their headline 96-97% is also a **binary** benign/malignant result, while this
+Himmel et all's headline 96-97% is also a **binary** benign/malignant result, while this
 pipeline does 7-class, so the numbers are not comparable. That accuracy is
 additionally inflated by augmenting *before* the train/test split, which leaks
-near-duplicate images across the boundary.
+near-duplicate images across the boundary.  [For more information on data leakage
+within the HAM10000 set, see this article.](https://ucsc-ospo.github.io/report/osre24/nyu/data-leakage/20240823-kyrillosishak/)
 
 ## Pipeline Architecture
 
@@ -99,7 +100,7 @@ sample images, real lesions score 0.42–0.78 solidity; streak masks score
 
 If no candidate is coherent, the original image is passed through unmasked
 and `segmentation.applied` is `false` — better than handing the classifier
-garbage. On the seven sample images, 5 segment cleanly and 2 (`bcc`, `nv`)
+garbage. On the seven [sample images](https://github.com/ltrickey/runpod-flash-demo/tree/main/sample_images), 5 segment cleanly and 2 (`bcc`, `nv`)
 fall back.
 
 A caveat worth knowing: HAM10000 images are already cropped and centered on
@@ -144,21 +145,43 @@ output lands in `results/`, also gitignored.
 
 If masking hurts only because the classifier never saw masked input, then
 training on masked images should close the gap. `train_worker.py` tests that
-by fine-tuning **two** models — one on SAM-masked images, one on the same
-images untouched — with identical data, lesion-grouped split, and
-hyperparameters. A single masked-trained model would settle nothing: a poor
-score could equally mean "masking is bad" or "a generic ImageNet backbone
-can't learn dermoscopy from this much data". Only the difference between the
-arms isolates masking.
+by fine-tuning **three** models on copies of the same images that differ only
+in preprocessing, with identical data, lesion-grouped split, and
+hyperparameters:
 
-**Both arms are fine-tuned on skin cancer images.** Each starts from the same
+| arm | training images |
+|-----|-----------------|
+| `raw` | untouched |
+| `masked` | SAM-masked — what the deployed pipeline actually produces |
+| `gtmasked` | masked with Tschandl's expert ground-truth masks |
+
+A single masked-trained model would settle nothing: a poor score could equally
+mean "masking is bad" or "a generic ImageNet backbone can't learn dermoscopy
+from this much data". Only the differences between arms isolate the variables.
+
+**Why `gtmasked` exists.** It answers the strongest objection to this whole
+experiment. SAM finds no coherent mask on ~29% of training images, so
+"masking hurts" could just mean "our masks were bad". The
+[HAM10000 lesion segmentations](https://www.kaggle.com/datasets/tschandl/ham10000-lesion-segmentations)
+provide one expert mask per image — all 10,015, no fallbacks — so the
+`gtmasked` arm is the best case masking can possibly achieve here. If it
+*still* loses to `raw`, the loss is inherent to masking rather than to SAM.
+The masks come from the same Harvard Dataverse record as HAM10000 itself
+(`HAM10000_segmentations_lesion_tschandl.zip`, 10.8MB, no auth), downloaded
+once to the network volume by `stage=prepare_gt`.
+
+That stage **backfills** from the raw images already on the volume rather than
+re-preparing: no HF streaming and no SAM pass, so it takes minutes instead of
+hours, and all three variants are guaranteed to come from byte-identical
+source images.
+
+**All arms are fine-tuned on skin cancer images.** Each starts from the same
 generic ImageNet checkpoint (`google/vit-base-patch32-224-in21k`, the
-architecture family Himel et al. report) and is then fine-tuned on HAM10000 —
-one on the masked copies, one on the identical images unmasked. Each is then
-evaluated on the preprocessing it was trained for. Neither is a plain
+architecture family Himel et al. report) and is then fine-tuned on HAM10000.
+Each is evaluated on the preprocessing it was trained for. None is a plain
 ImageNet model at evaluation time; the only variable is masking.
 
-Starting from the generic checkpoint rather than the community HAM10000 one
+Starting from the generic checkpoint rather than a [pre-trained community HAM10000 trained ViT model](https://huggingface.co/ALM-AHME/beit-large-patch16-224-finetuned-Lesion-Classification-HAM10000-AH-60-20-20)
 is deliberate: that checkpoint's model card doesn't say what it was trained
 on, so building on it would make any result hard to attribute.
 
@@ -173,10 +196,6 @@ are now trained here. No third-party classifier remains in the pipeline.
 `training_report.py` from the saved outputs of each stage. It carries the
 dataset composition, per-arm scores, the full model × input grid, and a
 decomposition of where the accuracy goes.
-
-Numbers are deliberately not duplicated here. Earlier revisions of this README
-carried measurements that silently went stale when the preprocessing changed,
-which is exactly the failure the report format is meant to avoid.
 
 Balanced accuracy (mean per-class recall) is reported alongside raw accuracy
 because the dataset is imbalanced enough that a majority-class predictor would
@@ -205,7 +224,7 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 `segment_worker.py` and `classify_worker.py` are plain function endpoints
 (not class-based): `pipeline.py` chains them by directly importing and
 `await`-ing them, following the pattern in
-`flash-examples/01_getting_started/03_mixed_workers`. A class-based
+[flash-examples/01_getting_started/03_mixed_workers](https://github.com/runpod/flash-examples/tree/main/01_getting_started/03_mixed_workers). A class-based
 `@Endpoint` (model loaded once in `__init__`) can't be called this way —
 Flash's cross-worker chaining only supports functions — nor can it be called
 from `Endpoint(id=...)` client mode, since that requires speaking an
@@ -223,14 +242,14 @@ The volume is datacenter-scoped, so attaching it pins `classify_worker` to
 across. That's a real capacity cost — during testing this endpoint was the
 first to end up `THROTTLED` when the account's worker quota was tight. The
 alternative is baking the weights into the deploy artifact, which avoids the
-pin but adds ~350MB to every deploy and a manual re-fetch after each retrain.
+pin but adds ~350MB to every deploy, or [fetching weights from S3](https://docs.runpod.io/storage/s3-api).  For this demo, pinning one datacenter made sense.
 
 ### Model caching: works deployed, breaks in dev
 
 Both workers load their model inside the endpoint function on **every call**.
 That's deliberate, and the reason is worth knowing.
 
-`flash-examples/docs/cli/workflows.md` ("Reduce cold starts") recommends
+[flash-examples/docs/cli/workflows.md](https://github.com/runpod/flash-examples/blob/main/docs/cli/workflows.md) ("Reduce cold starts") recommends
 caching the model in a module-level global:
 
 ```python
@@ -301,13 +320,22 @@ inputs can be shown side by side:
 
 ```
 results/
-├── <stem>_masked.png     # background blacked out, original framing kept
-└── <stem>_raw.png        # SAM bypassed entirely
+├── <stem>_masked.png           # background blacked out, original framing kept
+├── <stem>_masked-fallback.png  # masked arm, but SAM found no coherent mask
+└── <stem>_raw.png              # SAM bypassed entirely
 ```
 
-`--out-dir` changes where those land. `results/` is gitignored, since it's
-generated output — `training_report.py` picks these images up automatically
-and embeds them in the report's Examples section.
+The `-fallback` name is load-bearing. On the masked arm SAM sometimes finds no
+coherent mask and the original image passes through untouched, so the file is
+the same picture as `_raw.png`. Naming it apart keeps it from being read — or
+charted by `training_report.py` — as a real masked/raw comparison. The console
+output flags it too:
+
+```
+  ✓ masked  bcc    0.681   -> ..._masked-fallback.png   (no coherent mask -- passed through unmasked)
+```
+
+`--out-dir` changes where those land. 
 
 It also retries through cold-start 502s automatically, so the first call of a
 demo won't fail while the GPU workers warm up.
@@ -319,6 +347,10 @@ demo won't fail while the GPU workers warm up.
 | `lesion_pipeline` (LB) | `https://uvu4lc1mmlihc0.api.runpod.ai` — `POST /analyze`, `GET /health` |
 | `segment_worker` (QB) | `https://api.runpod.ai/v2/4h6wodvsn0zap7/runsync` |
 | `classify_worker` (QB) | `https://api.runpod.ai/v2/8064syplx1zsn0/runsync` |
+| `train_worker` (QB) | `https://api.runpod.ai/v2/f11k4djb0vnl82/run` — async; poll `/status/{job_id}` (`train_client.py` does this) |
+
+`train_worker` is listed with `/run` rather than `/runsync` because its stages
+run for minutes to hours, far longer than a synchronous request stays open.
 
 Two differences from local `flash dev` to watch for:
 
@@ -350,7 +382,7 @@ function. The giveaway was behavioural, not metadata: requesting `raw` and
 `masked` returned **identical confidences to six decimal places**, and the new
 `model_variant` key was absent from the response.
 
-The fix is to force the workers to cycle:
+The fix we used was to force the workers to cycle:
 
 ```bash
 # flat keys -- a nested {"workers": {...}} body is rejected with 400
@@ -382,7 +414,7 @@ its own sake — it's the only reliable way to see what failed in this tier.
 response provably distinguishes new code from old — a new field, or an
 argument the old code ignores.
 
-### Test the Pipeline
+### Test the Inference Pipeline
 
 ```bash
 # Full pipeline, raw arm (the default): SAM skipped, raw-trained model
@@ -523,7 +555,7 @@ runpod_trial/
 ├── fetch_eval_images.py # Local script: download the eval set
 ├── sample_images/      # 7 HAM10000 images, one per class (demo fixtures)
 ├── eval_images/        # 35 held-out images, 5 per class (gitignored)
-├── results/            # Generated reports and images (gitignored)
+├── results/            # Generated reports and images
 ├── .env.example        # Environment variable template
 ├── requirements.txt    # Python dependencies
 └── README.md
@@ -535,82 +567,13 @@ runpod_trial/
 
 QB workers process jobs from a queue. Each call to `/runsync` sends a job and waits
 for the result. Use QB for compute-heavy tasks that may take seconds to minutes.
-`segment_worker.py` and `classify_worker.py` are both function-based QB workers
-(see the caching note above for why, and the current tradeoff on model reloads).
+`segment_worker.py` and `classify_worker.py` are both function-based QB workers.
 
 ### Load-Balanced (LB) Workers
 
 LB workers expose standard HTTP endpoints (GET, POST, etc.) behind a load balancer.
 Use LB for low-latency API endpoints that need horizontal scaling. `pipeline.py` is
 an LB worker that orchestrates the two GPU workers above.
-
-### Client Mode
-
-Call an existing endpoint or a pre-built image without writing handler code:
-
-```python
-from runpod_flash import Endpoint
-
-# connect to an existing endpoint by id
-ep = Endpoint(id="ep-abc123")
-job = await ep.run({"prompt": "hello"})
-await job.wait()
-print(job.output)
-
-# deploy and call a pre-built image
-ep = Endpoint(name="vllm", image="runpod/worker-vllm:stable-cuda12.1.0")
-result = await ep.post("/v1/completions", {"prompt": "hello"})
-```
-
-This project doesn't use client mode — `pipeline.py` chains `segment_worker`/
-`classify_worker` via direct import instead (see the caching note above).
-Confirmed client mode can't invoke a **class-based** `@Endpoint` (it requires
-speaking an undocumented internal protocol). It remains untested against the
-**function-based** workers this project actually uses — direct import works,
-so there was no reason to switch.
-
-## Adding New Workers
-
-Create a new `.py` file with an `Endpoint`. `flash dev` auto-discovers all
-`Endpoint` functions in the project.
-
-```python
-# my_worker.py
-from runpod_flash import Endpoint, GpuType
-
-@Endpoint(name="my_worker", gpu=GpuType.NVIDIA_GEFORCE_RTX_4090, dependencies=["transformers"])
-async def predict(input_data: dict) -> dict:
-    from transformers import pipeline
-    pipe = pipeline("sentiment-analysis")
-    return pipe(input_data["text"])[0]
-```
-
-Then run `flash dev` -- the new worker appears automatically.
-
-## GPU Types
-
-| Config                                    | Hardware          | VRAM   |
-| ----------------------------------------- | ----------------- | ------ |
-| `GpuType.ANY`                             | Any available GPU | varies |
-| `GpuType.NVIDIA_GEFORCE_RTX_4090`         | RTX 4090          | 24 GB  |
-| `GpuType.NVIDIA_GEFORCE_RTX_5090`         | RTX 5090          | 32 GB  |
-| `GpuType.NVIDIA_RTX_6000_ADA_GENERATION`  | RTX 6000 Ada      | 48 GB  |
-| `GpuType.NVIDIA_L4`                       | L4                | 24 GB  |
-| `GpuType.NVIDIA_A100_80GB_PCIe`           | A100 PCIe         | 80 GB  |
-| `GpuType.NVIDIA_A100_SXM4_80GB`           | A100 SXM4         | 80 GB  |
-| `GpuType.NVIDIA_H100_80GB_HBM3`           | H100              | 80 GB  |
-| `GpuType.NVIDIA_H200`                     | H200              | 141 GB |
-| `GpuType.NVIDIA_B200`                     | B200              | 180 GB |
-
-## CPU Types
-
-Pass a CPU instance type string to `cpu=`:
-- `"cpu3c-1-2"` -- 1 vCPU, 2 GB RAM
-- `"cpu3c-4-8"` -- 4 vCPU, 8 GB RAM
-- `"cpu3g-2-8"` -- 2 vCPU, 8 GB RAM
-- `"cpu5g-4-16"` -- 4 vCPU, 16 GB RAM
-
-Or use `CpuInstanceType` enum values.
 
 ## Authentication
 
@@ -622,7 +585,7 @@ cp .env.example .env   # Then edit .env with your key
 ```
 
 Get your API key from [Runpod Settings](https://www.runpod.io/console/user/settings).
-Learn more from our [Documentation](https://docs.runpod.io/get-started/api-keys).
+Learn more from [Documentation](https://docs.runpod.io/get-started/api-keys).
 
 ## Environment Variables
 

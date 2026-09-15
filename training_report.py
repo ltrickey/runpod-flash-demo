@@ -18,7 +18,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RESULTS = Path("results")
-VARIANTS = ("masked", "raw")
+VARIANTS = ("masked", "raw", "gtmasked")
+
+# How each arm reads in prose. gtmasked is the control for mask quality:
+# expert masks instead of SAM's, so it is the best case masking can achieve.
+VARIANT_LABEL = {
+    "masked": "SAM-masked",
+    "raw": "raw",
+    "gtmasked": "ground-truth-masked",
+}
 
 
 def load(stage):
@@ -40,7 +48,7 @@ def table(headers, rows):
     ]
 
 
-def dataset_section(prepare):
+def dataset_section(prepare, prepare_gt=None):
     if not prepare:
         return ["## Dataset", "", "_No prepare output found._", ""]
 
@@ -52,11 +60,26 @@ def dataset_section(prepare):
     lines = [
         "## Dataset",
         "",
-        f"- **{total}** images from HAM10000, each written twice: SAM-masked "
-        "and untouched, so both training arms see identical source images.",
+        f"- **{total}** images from HAM10000, each written three ways: "
+        "SAM-masked, untouched, and ground-truth-masked, so every training "
+        "arm sees identical source images.",
         f"- SAM found a coherent mask on **{masked}**; **{passed}** "
         f"({passed / total * 100:.0f}%) had none and were passed through "
-        "unchanged — identical in both arms, which dilutes the contrast.",
+        "unchanged — identical to the raw copy, which dilutes the contrast.",
+    ]
+
+    if prepare_gt:
+        written = prepare_gt.get("written", 0) + prepare_gt.get("already_present", 0)
+        missing = prepare_gt.get("no_ground_truth_mask", 0)
+        coverage = prepare_gt.get("mean_coverage")
+        lines.append(
+            f"- Expert masks covered **{written}** images with **{missing}** "
+            "missing — no fallbacks at all, against SAM's "
+            f"{passed / total * 100:.0f}%. Mean lesion coverage "
+            + (f"**{coverage * 100:.1f}%**." if coverage else "unavailable.")
+        )
+
+    lines += [
         "",
         *table(
             ["class", "images"],
@@ -65,6 +88,50 @@ def dataset_section(prepare):
         "",
         "HAM10000 is imbalanced by nature (`df` and `vasc` are genuinely rare),"
         " which is why balanced accuracy is reported alongside raw accuracy.",
+        "",
+    ]
+    return lines
+
+
+def segmentation_section(seg):
+    """How good the pipeline's masks actually are, against the published ones."""
+    if not seg or seg.get("mean_iou") is None:
+        return []
+
+    reported = seg.get("himel_reported_iou")
+    rows = [
+        ["mean IoU (fallbacks counted as 0)", f"{seg['mean_iou']:.3f}"],
+        [
+            "mean IoU (fallbacks excluded)",
+            f"{seg['mean_iou_excluding_fallbacks']:.3f}"
+            if seg.get("mean_iou_excluding_fallbacks") is not None
+            else "—",
+        ],
+        ["mean Dice", f"{seg['mean_dice']:.3f}"],
+        [
+            "fallback rate",
+            f"{seg['fallback_rate'] * 100:.1f}% ({seg['fell_back']}/{seg['n']})"
+            if seg.get("fallback_rate") is not None
+            else "—",
+        ],
+    ]
+    if reported:
+        rows.append([f"Himel et al. reported IoU", f"{reported:.3f}"])
+
+    lines = [
+        "## Segmentation quality",
+        "",
+        "This pipeline prompts SAM zero-shot with a centre point. Himel et al. "
+        "report IoU 96.01% from a segmenter *trained* on these same masks, so "
+        "this is the gap between prompting and training. Scored on the same "
+        f"{seg['n']}-image test split as every accuracy number above.",
+        "",
+        *table(["metric", "value"], rows),
+        "",
+        "Both IoU figures are given on purpose. Counting fallbacks as 0 is what "
+        "the pipeline actually delivers, since a fallback passes the whole "
+        "unmasked image through. Excluding them says how well SAM does when it "
+        "commits to a lesion at all. Quoting only the second would flatter it.",
         "",
     ]
     return lines
@@ -83,7 +150,7 @@ def training_section(train):
         if arm:
             rows.append(
                 [
-                    f"trained on **{variant}**",
+                    f"trained on **{VARIANT_LABEL.get(variant, variant)}**",
                     pct(arm.get("test_accuracy")),
                     pct(arm.get("test_balanced_accuracy")),
                 ]
@@ -116,7 +183,7 @@ def grid_section(evaluate):
     rows = []
     for model_variant in VARIANTS:
         rows.append(
-            [f"trained on **{model_variant}**"]
+            [f"trained on **{VARIANT_LABEL.get(model_variant, model_variant)}**"]
             + [pct(cell(model_variant, data)) for data in VARIANTS]
         )
 
@@ -127,7 +194,9 @@ def grid_section(evaluate):
         " The diagonal is each model on its own preprocessing; the off-diagonal"
         " is the cost of a mismatch.",
         "",
-        *table(["", "tested on masked", "tested on raw"], rows),
+        *table(
+            [""] + [f"tested on {VARIANT_LABEL.get(v, v)}" for v in VARIANTS], rows
+        ),
         "",
     ]
     return lines, {
@@ -135,65 +204,100 @@ def grid_section(evaluate):
         "raw_on_masked": cell("raw", "masked"),
         "masked_on_masked": cell("masked", "masked"),
         "masked_on_raw": cell("masked", "raw"),
+        "raw_on_gtmasked": cell("raw", "gtmasked"),
+        "gtmasked_on_gtmasked": cell("gtmasked", "gtmasked"),
     }
 
 
 def decomposition_section(grid):
-    """Split the observed damage into mismatch vs unrecoverable loss."""
-    if not grid or any(value is None for value in grid.values()):
+    """Split the observed damage into mismatch vs unrecoverable loss.
+
+    Done once per masking source. Comparing the two is the point: the SAM and
+    ground-truth arms differ only in mask quality and consistency, so the gap
+    between their residuals is what bad masks actually cost.
+    """
+    if not grid or grid.get("raw_on_raw") is None:
         return []
 
     baseline = grid["raw_on_raw"]
-    mismatched = grid["raw_on_masked"]
-    retrained = grid["masked_on_masked"]
+    lines, summaries = [], []
 
-    mismatch_cost = (baseline - mismatched) * 100
-    recovered = (retrained - mismatched) * 100
-    residual = (baseline - retrained) * 100
+    for key, label in (("masked", "SAM masks"), ("gtmasked", "ground-truth masks")):
+        mismatched = grid.get(f"raw_on_{key}")
+        retrained = grid.get(f"{key}_on_{key}")
+        if mismatched is None or retrained is None:
+            continue
 
-    return [
-        "## Where the accuracy goes",
-        "",
-        *table(
-            ["effect", "points", "meaning"],
-            [
+        mismatch_cost = (baseline - mismatched) * 100
+        recovered = (retrained - mismatched) * 100
+        residual = (baseline - retrained) * 100
+        summaries.append((label, recovered, mismatch_cost, residual))
+
+        lines += [
+            f"### {label}",
+            "",
+            *table(
+                ["effect", "points", "meaning"],
                 [
-                    "mismatch cost",
-                    f"−{mismatch_cost:.1f}",
-                    "raw-trained model fed masked input",
+                    [
+                        "mismatch cost",
+                        f"−{mismatch_cost:.1f}",
+                        "raw-trained model fed masked input",
+                    ],
+                    [
+                        "recovered by retraining",
+                        f"+{recovered:.1f}",
+                        "training on masked removes the mismatch",
+                    ],
+                    [
+                        "residual loss",
+                        f"−{residual:.1f}",
+                        "never recovered — information the mask removed",
+                    ],
                 ],
-                [
-                    "recovered by retraining",
-                    f"+{recovered:.1f}",
-                    "training on masked removes the mismatch",
-                ],
-                [
-                    "residual loss",
-                    f"−{residual:.1f}",
-                    "never recovered — information the mask removed",
-                ],
-            ],
-        ),
-        "",
-        # Phrased from the numbers rather than asserted: which effect
-        # dominates has already flipped once between runs, and a hardcoded
-        # reading would have silently become false.
-        (
-            f"Retraining on masked images recovers {recovered:.1f} of the "
-            f"{mismatch_cost:.1f} points lost, leaving {residual:.1f} "
-            f"unrecovered — "
-            + (
-                "so most of the damage is a distribution mismatch that "
-                "training can fix, though a real remainder is lost signal."
-                if recovered > residual
-                else "so most of the damage is not a mismatch at all. "
-                "Training on masked images barely helps, which means the "
-                "masking is destroying information the classifier needs "
-                "rather than merely presenting it unfamiliarly."
-            )
-        ),
-        "",
-    ]
+            ),
+            "",
+            # Phrased from the numbers rather than asserted: which effect
+            # dominates has already flipped between runs, and a hardcoded
+            # reading would have silently become false.
+            (
+                f"Retraining recovers {recovered:.1f} of the "
+                f"{mismatch_cost:.1f} points lost, leaving {residual:.1f} "
+                f"unrecovered — "
+                + (
+                    "so most of the damage is a distribution mismatch that "
+                    "training can fix, though a real remainder is lost signal."
+                    if recovered > residual
+                    else "so most of the damage is not a mismatch at all. "
+                    "Training on masked images barely helps, which means the "
+                    "masking is destroying information the classifier needs "
+                    "rather than merely presenting it unfamiliarly."
+                )
+            ),
+            "",
+        ]
+
+    if not lines:
+        return []
+
+    header = ["## Where the accuracy goes", ""]
+
+    # The comparison between the two residuals is the headline: it separates
+    # "masking is harmful" from "our segmentation was bad".
+    if len(summaries) == 2:
+        (_, _, _, sam_residual), (_, _, _, gt_residual) = summaries
+        gap = sam_residual - gt_residual
+        header += [
+            f"Masking costs **{gt_residual:.1f} points** of balanced accuracy "
+            f"even with expert masks on every image. SAM masks cost "
+            f"**{sam_residual:.1f}**, so roughly **{gap:.1f} points** of the "
+            "original result was poor segmentation rather than masking "
+            "itself — and the remainder is the cost of masking done as well "
+            "as it can be done here.",
+            "",
+        ]
+
+    return header + lines
 
 
 def examples_section(limit=2):
@@ -237,6 +341,8 @@ def examples_section(limit=2):
 
 def main():
     prepare, train, evaluate = load("prepare"), load("train"), load("evaluate")
+    prepare_gt = load("prepare_gt")
+    seg_iou = load("segmentation_iou")
     if not any([prepare, train, evaluate]):
         raise SystemExit(
             "no results found — run train_client.py first "
@@ -249,13 +355,19 @@ def main():
         "# Masked vs raw: training experiment",
         "",
         f"_Generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}_",
+        "Updated by Lynn Trickey 2026-09-15",
         "",
         "Does SAM masking help or hurt classification, and if it hurts, is it "
-        "because the classifier never saw masked input? Two models are "
-        "fine-tuned on identical images — one masked, one not — and scored "
-        "against both input types.",
+        "because the classifier never saw masked input, or because the masks "
+        "themselves were bad? Three models are fine-tuned on identical "
+        "images — SAM-masked, untouched, and masked with expert ground-truth "
+        "boundaries — and each is scored against every input type.",
         "",
-        *dataset_section((prepare or {}).get("prepare")),
+        *dataset_section(
+            (prepare or {}).get("prepare"),
+            (prepare_gt or {}).get("prepare_gt"),
+        ),
+        *segmentation_section((seg_iou or {}).get("segmentation_iou")),
         *training_section((train or {}).get("train")),
         *grid_lines,
         *decomposition_section(grid),
@@ -273,7 +385,14 @@ def main():
         "- Images where SAM found no coherent mask are identical in both arms, "
         "which understates the true contrast.",
         "- 7-class, lesion-grouped split. Not comparable to published binary "
-        "HAM10000 numbers, which are typically much higher.",
+        "HAM10000 numbers, which are typically much higher due to 2 class "
+        "problem and likely data leakage.",
+        "- Himel et al. used 100 epochs and a larger dataset (6,000 training "
+        "images), enlarged by augmenting the malignant class with rotated, "
+        "flipped and zoomed-in copies. When we tried 30 epochs on an earlier, "
+        "larger subset of our data (~2,850 training images), our model "
+        "overfit: it scored worse than after 5 epochs. The runs reported here "
+        "use 10 epochs on 1,760 training images.",
         "",
     ]
 

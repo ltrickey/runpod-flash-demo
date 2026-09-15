@@ -1,0 +1,14 @@
+{
+  "segmentation_iou": {
+    "fallback_rate": 0.3235294117647059,
+    "fell_back": 132,
+    "himel_reported_iou": 0.9601,
+    "mean_dice": 0.4762889629498867,
+    "mean_iou": 0.3959015233721512,
+    "mean_iou_excluding_fallbacks": 0.5852457302023104,
+    "n": 408,
+    "no_ground_truth_mask": 0
+  },
+  "stage": "segmentation_iou",
+  "status": "success"
+}

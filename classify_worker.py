@@ -1,6 +1,5 @@
 # gpu serverless worker -- classifies a lesion image with the ViT fine-tuned
 # by train_worker.py (7-class: akiec, bcc, bkl, df, mel, nv, vasc).
-# run with: flash dev
 #
 # Serves either trained arm, selected per request. The pipeline pairs each
 # model with the preprocessing it was trained for -- a masked-trained model
@@ -8,8 +7,10 @@
 # measures a distribution mismatch rather than the preprocessing itself, and
 # would make masking look worse than it fairly is.
 #
-# Default is the raw arm: masking costs 14.2 points of balanced accuracy that
-# retraining cannot recover (see results/training_report.md).
+# Default is the raw arm. SAM masking costs 14.2 points of balanced accuracy
+# that retraining cannot recover; with expert ground-truth masks the cost is
+# still 7.0, so about half was poor segmentation and half is masking itself
+# (see results/training_report.md).
 #
 # Weights are read from the network volume rather than Hugging Face, which is
 # why this endpoint carries volume= and datacenter=. The volume is

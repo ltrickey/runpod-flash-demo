@@ -1,0 +1,11 @@
+{
+  "prepare_gt": {
+    "already_present": 0,
+    "mean_coverage": 0.29634568288854,
+    "no_ground_truth_mask": 0,
+    "total": 2548,
+    "written": 2548
+  },
+  "stage": "prepare_gt",
+  "status": "success"
+}
