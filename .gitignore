@@ -50,5 +50,4 @@ Notes for Dev Rel Presentation.docx
 # fetch_eval_images.py rather than committing them. Also keeps them out of the
 # deployed artifact -- flash ships the project directory to every worker, and
 # the workers never read these (only the local eval_sweep.py does).
-# eval_results.json IS committed, as the record of the sweep.
 eval_images/

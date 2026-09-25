@@ -215,6 +215,7 @@ sequence and exposes the whole thing as a single `POST /analyze` call.
 | `eval_sweep.py` | local script | Scores a whole directory across both arms |
 | `pipeline_client.py` | local module | Shared request/retry helpers for the two clients above |
 | `training_report.py` | local script | Builds `results/training_report.md` from the stage outputs |
+| `scripts/cycle_and_verify.py` | local script | Drains an endpoint's workers, then proves which code is live |
 | `train_worker.py` | GPU, queue-based (function) | Endpoint + stage dispatch: fine-tunes the three arms on a network volume |
 | `lesion_training/` | package | The stages themselves: data prep, ViT training and scoring, segmentation IoU |
 | `train_client.py` | local script | Submits training jobs and polls to completion |
@@ -383,12 +384,15 @@ Two differences from local `flash dev` to watch for:
   (`/analyze`), while `flash dev` namespaces them under the endpoint name
   (`/pipeline/analyze`). `demo_client.py` handles both automatically.
 
-**Cold-start caveat for live demos:** a fully cold `/analyze` (both GPU
-workers provisioning, plus loading the models) consistently failed with
-a 502 at around 40-45 seconds, which looks like a gateway timeout ahead of the
-worker. Once the workers are up, calls succeed. `demo_client.py` and
-`eval_sweep.py` retry through these automatically; if you're using `curl`,
-send a throwaway request first to get the workers provisioned.
+**Cold-start caveat for live demos:** a fully cold `/analyze` has to
+provision a CPU pipeline worker and the GPU workers, then load SAM (from
+Hugging Face) and the classifier (from the network volume). Timed from zero
+workers, the gateway held the request and answered after **55s**; a second
+call on a just-idle worker took **68s**. Both succeeded, so there is no fixed
+40-45s gateway deadline. Cold calls do intermittently return **502** instead
+-- seen during demo runs, cause unconfirmed -- which is why `demo_client.py`
+and `eval_sweep.py` retry automatically. If you're using `curl`, send a
+throwaway request first to get the workers provisioned.
 
 ### After deploying, warm workers can keep serving old code
 
@@ -576,6 +580,7 @@ runpod_trial/
 ├── pipeline_client.py  # Local module: shared request/retry helpers
 ├── train_client.py     # Local script: submit training jobs and poll
 ├── training_report.py  # Local script: build the training report
+├── scripts/            # Local tooling: cycle_and_verify.py (worker cycling)
 ├── fetch_eval_images.py # Local script: download the eval set
 ├── sample_images/      # 7 HAM10000 images, one per class (demo fixtures)
 ├── eval_images/        # 35 held-out images, 5 per class (gitignored)

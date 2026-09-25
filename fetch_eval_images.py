@@ -21,18 +21,11 @@ from pathlib import Path
 
 from datasets import load_dataset
 
-DATASET = "marmal88/skin_cancer"
+# Same mapping the training pipeline uses. Imported rather than copied so the
+# eval set can never be labelled by a different rule than the training data.
+from lesion_training.common import DX_TO_CLASS
 
-# The dataset spells diagnoses out; the classifier uses HAM10000's short codes.
-DX_TO_CLASS = {
-    "actinic_keratoses": "akiec",
-    "basal_cell_carcinoma": "bcc",
-    "benign_keratosis-like_lesions": "bkl",
-    "dermatofibroma": "df",
-    "melanoma": "mel",
-    "melanocytic_Nevi": "nv",
-    "vascular_lesions": "vasc",
-}
+DATASET = "marmal88/skin_cancer"
 
 
 def existing_image_ids(*directories):

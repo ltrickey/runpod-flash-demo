@@ -43,9 +43,12 @@ def resolve_target(url, path_override=None):
 def call_pipeline(url, path, headers, image_base64, arm="raw"):
     """POST to the pipeline, retrying through cold-start 502s.
 
-    A fully cold call has to provision GPU workers and load the models from
-    the network volume, which takes longer than the load balancer's gateway
-    timeout and surfaces as a 502. Retrying rides it out.
+    A fully cold call provisions a CPU worker for the pipeline and GPU workers
+    for SAM (weights pulled from Hugging Face) and the classifier (weights read
+    from the network volume). Measured from zero workers, the gateway holds the
+    request open and answers after ~55s rather than timing out. Cold calls do
+    sometimes come back 502 instead -- the cause is unconfirmed, and it is not
+    simply a fixed gateway deadline -- so retrying rides it out.
     """
     payload = {"input_data": {"image_base64": image_base64, "arm": arm}}
 

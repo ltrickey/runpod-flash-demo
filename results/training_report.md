@@ -1,7 +1,7 @@
 # Masked vs raw: training experiment
 
-_Generated 2026-09-14 16:29 UTC_
-Updated by Lynn Trickey 2026 9-15
+_Generated 2026-09-25 22:07 UTC_
+Updated by Lynn Trickey 2026-09-15
 
 Does SAM masking help or hurt classification, and if it hurts, is it because the classifier never saw masked input, or because the masks themselves were bad? Three models are fine-tuned on identical images — SAM-masked, untouched, and masked with expert ground-truth boundaries — and each is scored against every input type.
 
@@ -95,8 +95,6 @@ What the two inputs actually look like:
 |---|---|
 | ![masked](mel_ISIC_0024351_masked.png) | ![raw](mel_ISIC_0024351_raw.png) |
 
-_2 further pair(s) omitted: SAM found no coherent mask, so the masked and raw inputs are identical._
-
 ## Caveats
 
 - Single run, single seed, no error bars.
@@ -104,4 +102,4 @@ _2 further pair(s) omitted: SAM found no coherent mask, so the masked and raw in
 - Lesion pixels keep their colour. Himel et al.'s wording ("converted to binary masking", white = lesion / black = everything else) more likely means their ViT saw the bare silhouette. Keeping the pixels is the more generous reading, so these numbers are an upper bound on how well their stated preprocessing could do.
 - Images where SAM found no coherent mask are identical in both arms, which understates the true contrast.
 - 7-class, lesion-grouped split. Not comparable to published binary HAM10000 numbers, which are typically much higher due to 2 class problem and likely data leakage.
-- Himmel paper used 30 epochs and larger dataset with duplicate images (cropped or transformed) to increase dataset.  When we tried 30 epochs with this size dataset, our model suffered from overfitting.
+- Himel et al. used 100 epochs and a larger dataset (6,000 training images), enlarged by augmenting the malignant class with rotated, flipped and zoomed-in copies. When we tried 30 epochs on an earlier, larger subset of our data (~2,850 training images), our model overfit: it scored worse than after 5 epochs. The runs reported here use 10 epochs on 1,760 training images.

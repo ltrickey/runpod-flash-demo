@@ -16,8 +16,8 @@ Saves the image each arm actually classified, so the masked and raw inputs can
 be shown side by side.
 
 usage:
-    python demo_client.py sample_images/mel_ISIC_0024351.jpg
-    python demo_client.py sample_images/mel_ISIC_0024351.jpg --url https://<id>.api.runpod.ai
+    python demo_client.py sample_images/bcc_ISIC_0024431.jpg
+    python demo_client.py sample_images/bcc_ISIC_0024431.jpg --url https://uvu4lc1mmlihc0.api.runpod.ai
 """
 
 import argparse
